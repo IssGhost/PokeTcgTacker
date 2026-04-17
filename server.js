@@ -333,6 +333,26 @@ function normalizeRetailer(value) {
   return String(value || "").trim().toLowerCase();
 }
 
+function retailerSearchUrl(retailer, productName) {
+  const normalizedRetailer = normalizeRetailer(retailer);
+  const encodedName = encodeURIComponent(String(productName || "").trim());
+  if (!encodedName) return null;
+
+  if (normalizedRetailer.includes("target")) {
+    return `https://www.target.com/s?searchTerm=${encodedName}`;
+  }
+  if (normalizedRetailer.includes("walmart")) {
+    return `https://www.walmart.com/search?q=${encodedName}`;
+  }
+  if (normalizedRetailer.includes("best buy")) {
+    return `https://www.bestbuy.com/site/searchpage.jsp?st=${encodedName}`;
+  }
+  if (normalizedRetailer.includes("gamestop")) {
+    return `https://www.gamestop.com/search/?q=${encodedName}`;
+  }
+  return null;
+}
+
 function statusLabel(status) {
   if (status === "in_stock") return "IN STOCK";
   if (status === "out_of_stock") return "OUT OF STOCK";
@@ -642,6 +662,9 @@ app.get("/dashboard", requireAuth, (req, res) => {
         <form method="post" action="/alerts/${t.id}/delete" onsubmit="return confirm('Delete this alert target?')">
           <button>Delete</button>
         </form>
+        <form method="post" action="/alerts/${t.id}/find-link" style="margin-top:8px;">
+          <button>Find store link</button>
+        </form>
       </td>
     </tr>`).join("")
   : `<tr><td colspan="7" class="muted">No alert targets yet.</td></tr>`;
@@ -678,7 +701,7 @@ app.get("/dashboard", requireAuth, (req, res) => {
         <form method="post" action="/alerts">
           <label>Name</label><input name="name" required placeholder="Journey Together ETB" />
           <label style="margin-top:12px; display:block;">Retailer</label><input name="retailer" required placeholder="Target" />
-          <label style="margin-top:12px; display:block;">Product URL</label><input name="product_url" required type="url" placeholder="https://www.target.com/..." />
+          <label style="margin-top:12px; display:block;">Product URL</label><input name="product_url" type="url" placeholder="Optional. Auto-built from Name + Retailer for 4 main stores." />
           <label style="margin-top:12px; display:block;">Channel type</label>
           <select name="channel_type">
             <option value="discord">Discord webhook</option>
@@ -717,8 +740,14 @@ app.post("/alerts", requireAuth, (req, res) => {
   };
 
   const fallbackWebhook = String(user.discord_webhook || "").trim();
-  if (!payload.name || !payload.retailer || !payload.product_url) {
+  if (!payload.name || !payload.retailer) {
     return res.status(400).send(renderPage("Invalid target", `<div class="card"><p class="danger">Fill in every field.</p><a href="/dashboard"><button>Back</button></a></div>`, user));
+  }
+  if (!payload.product_url) {
+    payload.product_url = retailerSearchUrl(payload.retailer, payload.name) || "";
+  }
+  if (!payload.product_url) {
+    return res.status(400).send(renderPage("Invalid target", `<div class="card"><p class="danger">Add a product URL, or use one of these retailers for auto-linking: Target, Walmart, Best Buy, GameStop.</p><a href="/dashboard"><button>Back</button></a></div>`, user));
   }
   if (payload.channel_type === "discord" && !payload.channel_value && !fallbackWebhook) {
     return res.status(400).send(renderPage("Invalid target", `<div class="card"><p class="danger">Add a channel value or set a default Discord webhook first.</p><a href="/dashboard"><button>Back</button></a></div>`, user));
@@ -736,6 +765,24 @@ app.post("/alerts", requireAuth, (req, res) => {
   `).run(user.id, payload.name, payload.retailer, payload.product_url, payload.channel_type, finalChannelValue);
 
   res.redirect("/dashboard");
+});
+
+app.post("/alerts/:id/find-link", requireAuth, (req, res) => {
+  const user = ownerOverride(getUserById(req.auth.sub));
+  const alertId = Number(req.params.id);
+  const target = db.prepare("SELECT * FROM alert_targets WHERE id = ? AND user_id = ?").get(alertId, user.id);
+
+  if (!target) {
+    return res.redirect("/dashboard?flash=error&message=Alert%20target%20not%20found");
+  }
+
+  const guessedUrl = retailerSearchUrl(target.retailer, target.name);
+  if (!guessedUrl) {
+    return res.redirect("/dashboard?flash=error&message=Could%20not%20auto-build%20a%20store%20link%20for%20this%20retailer");
+  }
+
+  db.prepare("UPDATE alert_targets SET product_url = ? WHERE id = ? AND user_id = ?").run(guessedUrl, alertId, user.id);
+  return res.redirect("/dashboard?flash=success&message=Store%20search%20link%20updated");
 });
 
 app.post("/settings/discord-webhook", requireAuth, (req, res) => {
