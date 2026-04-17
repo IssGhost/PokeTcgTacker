@@ -5,6 +5,7 @@ const cookieParser = require("cookie-parser");
 const helmet = require("helmet");
 const bcrypt = require("bcryptjs");
 const Stripe = require("stripe");
+const https = require("https");
 const path = require("path");
 
 const { createDb } = require("./db");
@@ -145,6 +146,63 @@ function planFromPriceId(priceId) {
 
 function quotaForPlan(planId) {
   return PLANS[planId]?.alertsQuota ?? PLANS.free.alertsQuota;
+}
+
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+}
+
+function postJson(url, payload) {
+  return new Promise((resolve, reject) => {
+    const body = JSON.stringify(payload);
+    const req = https.request(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Content-Length": Buffer.byteLength(body)
+      }
+    }, (res) => {
+      let responseBody = "";
+      res.on("data", chunk => {
+        responseBody += chunk;
+      });
+      res.on("end", () => {
+        if (res.statusCode >= 200 && res.statusCode < 300) {
+          resolve({ statusCode: res.statusCode, body: responseBody });
+          return;
+        }
+        reject(new Error(`Webhook POST failed with ${res.statusCode}: ${responseBody}`));
+      });
+    });
+
+    req.on("error", reject);
+    req.write(body);
+    req.end();
+  });
+}
+
+async function sendDiscordAlert(target, options = {}) {
+  if (target.channel_type !== "discord") {
+    throw new Error("Only Discord webhook targets are supported for test sends.");
+  }
+
+  const productName = options.productName || target.name;
+  const retailer = options.retailer || target.retailer;
+  const timeAgo = options.timeAgo || "3 hours ago";
+  const headline = options.headline || `This product was dropped at ${retailer} ${timeAgo}. Keep up to date with us.`;
+
+  const content = [
+    headline,
+    `Product: ${productName}`,
+    `Link: ${target.product_url}`
+  ].join("\n");
+
+  return postJson(target.channel_value, { content });
 }
 
 ensureOwnerSeeded();
@@ -327,6 +385,14 @@ app.get("/dashboard", requireAuth, (req, res) => {
   const user = ownerOverride(getUserById(req.auth.sub));
   const targets = db.prepare("SELECT * FROM alert_targets WHERE user_id = ? ORDER BY created_at DESC").all(user.id);
   const remaining = Math.max(user.alerts_quota - targets.length, 0);
+  const flash = String(req.query.flash || "").trim();
+  const message = String(req.query.message || "").trim();
+
+  const flashHtml = flash && message ? `
+    <div class="card">
+      <p class="${flash === "success" ? "success" : "danger"}">${escapeHtml(message)}</p>
+    </div>
+  ` : "";
 
   const rows = targets.length ? targets.map(t => `
     <tr>
@@ -336,6 +402,9 @@ app.get("/dashboard", requireAuth, (req, res) => {
       <td>${t.channel_type}</td>
       <td>${t.active ? "Active" : "Paused"}</td>
       <td>
+        <form method="post" action="/alerts/${t.id}/test" style="margin-bottom:8px;">
+          <button>Send Test Alert</button>
+        </form>
         <form method="post" action="/alerts/${t.id}/delete" onsubmit="return confirm('Delete this alert target?')">
           <button>Delete</button>
         </form>
@@ -344,6 +413,7 @@ app.get("/dashboard", requireAuth, (req, res) => {
   : `<tr><td colspan="6" class="muted">No alert targets yet.</td></tr>`;
 
   const body = `
+    ${flashHtml}
     <div class="grid">
       <div class="card">
         <h2>Account</h2>
@@ -407,6 +477,24 @@ app.post("/alerts", requireAuth, (req, res) => {
   `).run(user.id, payload.name, payload.retailer, payload.product_url, payload.channel_type, payload.channel_value);
 
   res.redirect("/dashboard");
+});
+
+app.post("/alerts/:id/test", requireAuth, async (req, res) => {
+  const user = ownerOverride(getUserById(req.auth.sub));
+  const alertId = Number(req.params.id);
+  const target = db.prepare("SELECT * FROM alert_targets WHERE id = ? AND user_id = ?").get(alertId, user.id);
+
+  if (!target) {
+    return res.redirect("/dashboard?flash=error&message=Alert%20target%20not%20found");
+  }
+
+  try {
+    await sendDiscordAlert(target, { timeAgo: "3 hours ago" });
+    return res.redirect("/dashboard?flash=success&message=Test%20alert%20sent%20to%20Discord");
+  } catch (err) {
+    console.error("Test alert send failed:", err);
+    return res.redirect("/dashboard?flash=error&message=Discord%20test%20send%20failed");
+  }
 });
 
 app.post("/alerts/:id/delete", requireAuth, (req, res) => {
