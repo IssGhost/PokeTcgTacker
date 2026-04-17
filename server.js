@@ -22,7 +22,6 @@ const PORT = process.env.PORT || 3000;
 const APP_URL = process.env.APP_URL || `http://localhost:${PORT}`;
 const AUTO_SCAN_ENABLED = String(process.env.AUTO_SCAN_ENABLED || "true").toLowerCase() !== "false";
 const AUTO_SCAN_INTERVAL_MS = Math.max(Number(process.env.AUTO_SCAN_INTERVAL_MS || 180000), 30000);
-const MAIN_RETAILERS = ["target", "walmart", "best buy", "gamestop"];
 
 const PLANS = {
   free: {
@@ -333,6 +332,10 @@ function normalizeRetailer(value) {
   return String(value || "").trim().toLowerCase();
 }
 
+function isTargetRetailer(value) {
+  return normalizeRetailer(value).includes("target");
+}
+
 function retailerSearchUrl(retailer, productName) {
   const normalizedRetailer = normalizeRetailer(retailer);
   const encodedName = encodeURIComponent(String(productName || "").trim());
@@ -340,15 +343,6 @@ function retailerSearchUrl(retailer, productName) {
 
   if (normalizedRetailer.includes("target")) {
     return `https://www.target.com/s?searchTerm=${encodedName}`;
-  }
-  if (normalizedRetailer.includes("walmart")) {
-    return `https://www.walmart.com/search?q=${encodedName}`;
-  }
-  if (normalizedRetailer.includes("best buy")) {
-    return `https://www.bestbuy.com/site/searchpage.jsp?st=${encodedName}`;
-  }
-  if (normalizedRetailer.includes("gamestop")) {
-    return `https://www.gamestop.com/search/?q=${encodedName}`;
   }
   return null;
 }
@@ -361,54 +355,76 @@ function statusLabel(status) {
 }
 
 async function sendMarketSnapshot(user) {
+  throw new Error("sendMarketSnapshot is deprecated. Use sendTarget24hUpdate instead.");
+}
+
+function buildTarget24hSummary(userId) {
+  const recentEvents = db.prepare(`
+    SELECT e.created_at, e.event_type, t.name, t.retailer, t.product_url
+    FROM alert_events e
+    JOIN alert_targets t ON t.id = e.alert_target_id
+    WHERE e.user_id = ?
+      AND lower(t.retailer) LIKE '%target%'
+      AND e.created_at >= datetime('now', '-24 hours')
+    ORDER BY e.created_at DESC
+    LIMIT 25
+  `).all(userId);
+
+  const currentInStock = db.prepare(`
+    SELECT id, name, retailer, product_url, last_scan_at
+    FROM alert_targets
+    WHERE user_id = ?
+      AND active = 1
+      AND channel_type = 'discord'
+      AND lower(retailer) LIKE '%target%'
+      AND last_scan_status = 'in_stock'
+    ORDER BY last_scan_at DESC
+  `).all(userId);
+
+  const currentPreOrder = db.prepare(`
+    SELECT id, name, retailer, product_url, last_scan_at
+    FROM alert_targets
+    WHERE user_id = ?
+      AND active = 1
+      AND channel_type = 'discord'
+      AND lower(retailer) LIKE '%target%'
+      AND last_scan_status = 'pre_order'
+    ORDER BY last_scan_at DESC
+  `).all(userId);
+
+  return {
+    recentEvents,
+    currentInStock,
+    currentPreOrder
+  };
+}
+
+async function sendTarget24hUpdate(user) {
   const webhook = String(user.discord_webhook || "").trim();
   if (!isValidDiscordWebhookUrl(webhook)) {
-    throw new Error("A valid default Discord webhook is required to send market snapshot.");
+    throw new Error("A valid default Discord webhook is required to send Target updates.");
   }
 
-  const targets = db.prepare(`
-    SELECT *
-    FROM alert_targets
-    WHERE user_id = ? AND active = 1 AND channel_type = 'discord'
-    ORDER BY created_at DESC
-  `).all(user.id);
-
-  const selectedTargets = [];
-  for (const retailer of MAIN_RETAILERS) {
-    const match = targets.find((target) => normalizeRetailer(target.retailer).includes(retailer));
-    if (match) selectedTargets.push(match);
-  }
-
-  const lines = [];
-  for (const retailer of MAIN_RETAILERS) {
-    const target = selectedTargets.find((item) => normalizeRetailer(item.retailer).includes(retailer));
-    if (!target) {
-      lines.push(`${retailer.toUpperCase()}: NO TARGET CONFIGURED`);
-      continue;
-    }
-
-    const scanned = await scanAlertTarget(target);
-    const now = new Date().toISOString();
-    db.prepare(`
-      UPDATE alert_targets
-      SET last_scan_status = ?, last_scan_at = ?
-      WHERE id = ?
-    `).run(scanned.status, now, target.id);
-
-    lines.push(
-      `${target.retailer.toUpperCase()}: ${statusLabel(scanned.status)} | ${target.name} | ${target.product_url}`
-    );
-  }
+  const summary = buildTarget24hSummary(user.id);
+  const eventLines = summary.recentEvents.slice(0, 10).map((event) => {
+    return `- ${event.created_at} | ${statusLabel(event.event_type === "in_stock" ? "in_stock" : "unknown")} | ${event.name} | ${event.product_url}`;
+  });
 
   const content = [
-    "Pokemon Market Snapshot (Target, Walmart, Best Buy, GameStop)",
-    ...lines
+    "Target 24-Hour Stock Update",
+    `In-stock detections in last 24 hours: ${summary.recentEvents.length}`,
+    `Currently in stock right now: ${summary.currentInStock.length}`,
+    `Currently pre-order right now: ${summary.currentPreOrder.length}`,
+    "",
+    "Recent events:",
+    ...(eventLines.length ? eventLines : ["- No in-stock events logged in last 24 hours"])
   ].join("\n");
 
   return postJson(webhook, { content });
 }
 
-async function runAutomatedScan(userId = null) {
+async function runAutomatedScan(userId = null, options = {}) {
+  const targetOnly = options.targetOnly !== false;
   const targets = db.prepare(`
     SELECT t.*, u.discord_webhook
     FROM alert_targets t
@@ -419,6 +435,10 @@ async function runAutomatedScan(userId = null) {
   `).all(userId, userId);
 
   for (const target of targets) {
+    if (targetOnly && !isTargetRetailer(target.retailer)) {
+      continue;
+    }
+
     const webhook = getDiscordWebhookForTarget(target);
     const startedAt = new Date().toISOString();
     const result = await scanAlertTarget(target);
@@ -637,6 +657,7 @@ app.post("/logout", (req, res) => {
 app.get("/dashboard", requireAuth, (req, res) => {
   const user = ownerOverride(getUserById(req.auth.sub));
   const targets = db.prepare("SELECT * FROM alert_targets WHERE user_id = ? ORDER BY created_at DESC").all(user.id);
+  const targetSummary = buildTarget24hSummary(user.id);
   const remaining = Math.max(user.alerts_quota - targets.length, 0);
   const flash = String(req.query.flash || "").trim();
   const message = String(req.query.message || "").trim();
@@ -682,18 +703,18 @@ app.get("/dashboard", requireAuth, (req, res) => {
         <a href="/pricing"><button>Change plan</button></a>
       </div>
       <div class="card">
-        <h2>Discord defaults</h2>
-        <p class="muted">Set a default webhook once. New and existing Discord targets can use this automatically.</p>
+        <h2>Target drop tools</h2>
+        <p class="muted">Current implementation is Target-only: scan now, track current Target drops, and send a 24-hour recap.</p>
         <form method="post" action="/settings/discord-webhook">
           <label>Default Discord webhook</label>
           <input name="discord_webhook" type="url" placeholder="https://discord.com/api/webhooks/..." value="${escapeHtml(user.discord_webhook || "")}" />
           <div style="margin-top:16px;"><button>Save default webhook</button></div>
         </form>
-        <form method="post" action="/alerts/scan-now" style="margin-top:12px;">
-          <button>Run automated scan now</button>
+        <form method="post" action="/alerts/target/scan-now" style="margin-top:12px;">
+          <button>Scan Target drops now</button>
         </form>
-        <form method="post" action="/alerts/send-market-snapshot" style="margin-top:12px;">
-          <button>Send 4-store snapshot</button>
+        <form method="post" action="/alerts/target/send-update" style="margin-top:12px;">
+          <button>Send Target 24h update to Discord</button>
         </form>
       </div>
       <div class="card">
@@ -701,7 +722,7 @@ app.get("/dashboard", requireAuth, (req, res) => {
         <form method="post" action="/alerts">
           <label>Name</label><input name="name" required placeholder="Journey Together ETB" />
           <label style="margin-top:12px; display:block;">Retailer</label><input name="retailer" required placeholder="Target" />
-          <label style="margin-top:12px; display:block;">Product URL</label><input name="product_url" type="url" placeholder="Optional. Auto-built from Name + Retailer for 4 main stores." />
+          <label style="margin-top:12px; display:block;">Product URL</label><input name="product_url" type="url" placeholder="Optional. Auto-built from Name + Retailer for Target only." />
           <label style="margin-top:12px; display:block;">Channel type</label>
           <select name="channel_type">
             <option value="discord">Discord webhook</option>
@@ -719,6 +740,18 @@ app.get("/dashboard", requireAuth, (req, res) => {
         <thead><tr><th>Name</th><th>Retailer</th><th>URL</th><th>Channel</th><th>Status</th><th>Last scan</th><th>Action</th></tr></thead>
         <tbody>${rows}</tbody>
       </table>
+    </div>
+
+    <div class="card">
+      <h2>Target update (last 24 hours + right now)</h2>
+      <p><strong>In-stock detections (24h):</strong> ${targetSummary.recentEvents.length}</p>
+      <p><strong>Current Target drops in stock right now:</strong> ${targetSummary.currentInStock.length}</p>
+      <p><strong>Current Target drops in pre-order right now:</strong> ${targetSummary.currentPreOrder.length}</p>
+      <ul>
+        ${targetSummary.recentEvents.length
+          ? targetSummary.recentEvents.slice(0, 10).map((event) => `<li>${escapeHtml(event.created_at)} — ${escapeHtml(event.name)} — <a href="${event.product_url}" target="_blank" rel="noopener noreferrer">Open</a></li>`).join("")
+          : "<li class=\"muted\">No Target in-stock events recorded in the last 24 hours yet.</li>"}
+      </ul>
     </div>
   `;
   res.send(renderPage("Dashboard", body, user));
@@ -747,7 +780,7 @@ app.post("/alerts", requireAuth, (req, res) => {
     payload.product_url = retailerSearchUrl(payload.retailer, payload.name) || "";
   }
   if (!payload.product_url) {
-    return res.status(400).send(renderPage("Invalid target", `<div class="card"><p class="danger">Add a product URL, or use one of these retailers for auto-linking: Target, Walmart, Best Buy, GameStop.</p><a href="/dashboard"><button>Back</button></a></div>`, user));
+    return res.status(400).send(renderPage("Invalid target", `<div class="card"><p class="danger">Add a product URL, or use retailer Target for auto-linking.</p><a href="/dashboard"><button>Back</button></a></div>`, user));
   }
   if (payload.channel_type === "discord" && !payload.channel_value && !fallbackWebhook) {
     return res.status(400).send(renderPage("Invalid target", `<div class="card"><p class="danger">Add a channel value or set a default Discord webhook first.</p><a href="/dashboard"><button>Back</button></a></div>`, user));
@@ -795,25 +828,25 @@ app.post("/settings/discord-webhook", requireAuth, (req, res) => {
   res.redirect("/dashboard?flash=success&message=Default%20Discord%20webhook%20saved");
 });
 
-app.post("/alerts/scan-now", requireAuth, async (req, res) => {
+app.post("/alerts/target/scan-now", requireAuth, async (req, res) => {
   const user = ownerOverride(getUserById(req.auth.sub));
   try {
-    await runAutomatedScan(user.id);
-    return res.redirect("/dashboard?flash=success&message=Automated%20scan%20completed");
+    await runAutomatedScan(user.id, { targetOnly: true });
+    return res.redirect("/dashboard?flash=success&message=Target%20scan%20completed.%20Check%20the%2024h%20update%20card%20below.");
   } catch (err) {
     console.error("Manual scan failed:", err);
-    return res.redirect("/dashboard?flash=error&message=Automated%20scan%20failed");
+    return res.redirect("/dashboard?flash=error&message=Target%20scan%20failed");
   }
 });
 
-app.post("/alerts/send-market-snapshot", requireAuth, async (req, res) => {
+app.post("/alerts/target/send-update", requireAuth, async (req, res) => {
   const user = ownerOverride(getUserById(req.auth.sub));
   try {
-    await sendMarketSnapshot(user);
-    return res.redirect("/dashboard?flash=success&message=4-store%20snapshot%20sent%20to%20Discord");
+    await sendTarget24hUpdate(user);
+    return res.redirect("/dashboard?flash=success&message=Target%2024h%20update%20sent%20to%20Discord");
   } catch (err) {
-    console.error("Snapshot send failed:", err);
-    return res.redirect("/dashboard?flash=error&message=Snapshot%20send%20failed.%20Set%20a%20valid%20default%20webhook.");
+    console.error("Target update send failed:", err);
+    return res.redirect("/dashboard?flash=error&message=Target%20update%20send%20failed.%20Set%20a%20valid%20default%20webhook.");
   }
 });
 
@@ -895,7 +928,7 @@ app.get("/health", (_req, res) => {
 
 if (AUTO_SCAN_ENABLED) {
   setInterval(() => {
-    runAutomatedScan().catch((err) => {
+    runAutomatedScan(null, { targetOnly: true }).catch((err) => {
       console.error("Automated scan failed:", err);
     });
   }, AUTO_SCAN_INTERVAL_MS);
