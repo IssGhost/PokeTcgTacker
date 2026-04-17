@@ -1,0 +1,21 @@
+{
+  "name": "pokemon-alerts-saas",
+  "version": "1.0.0",
+  "description": "Subscription-ready Pokemon TCG alert SaaS starter",
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "dependencies": {
+    "bcryptjs": "^2.4.3",
+    "better-sqlite3": "^11.9.1",
+    "cookie-parser": "^1.4.7",
+    "dotenv": "^16.4.5",
+    "express": "^4.21.2",
+    "helmet": "^8.1.0",
+    "jsonwebtoken": "^9.0.2",
+    "stripe": "^18.3.0"
+  }
+}
