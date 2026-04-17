@@ -5,6 +5,8 @@ const cookieParser = require("cookie-parser");
 const helmet = require("helmet");
 const bcrypt = require("bcryptjs");
 const Stripe = require("stripe");
+const http = require("http");
+const https = require("https");
 const path = require("path");
 
 const { createDb } = require("./db");
@@ -18,6 +20,8 @@ const stripe = stripeKey ? new Stripe(stripeKey) : null;
 
 const PORT = process.env.PORT || 3000;
 const APP_URL = process.env.APP_URL || `http://localhost:${PORT}`;
+const AUTO_SCAN_ENABLED = String(process.env.AUTO_SCAN_ENABLED || "true").toLowerCase() !== "false";
+const AUTO_SCAN_INTERVAL_MS = Math.max(Number(process.env.AUTO_SCAN_INTERVAL_MS || 180000), 30000);
 
 const PLANS = {
   free: {
@@ -145,6 +149,226 @@ function planFromPriceId(priceId) {
 
 function quotaForPlan(planId) {
   return PLANS[planId]?.alertsQuota ?? PLANS.free.alertsQuota;
+}
+
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+}
+
+function postJson(url, payload) {
+  return new Promise((resolve, reject) => {
+    let parsedUrl;
+    try {
+      parsedUrl = new URL(url);
+    } catch {
+      reject(new Error("Invalid webhook URL"));
+      return;
+    }
+
+    const body = JSON.stringify(payload);
+    const req = https.request(parsedUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Content-Length": Buffer.byteLength(body)
+      }
+    }, (res) => {
+      let responseBody = "";
+      res.on("data", chunk => {
+        responseBody += chunk;
+      });
+      res.on("end", () => {
+        if (res.statusCode >= 200 && res.statusCode < 300) {
+          resolve({ statusCode: res.statusCode, body: responseBody });
+          return;
+        }
+        reject(new Error(`Webhook POST failed with ${res.statusCode}: ${responseBody}`));
+      });
+    });
+
+    req.on("error", reject);
+    req.write(body);
+    req.end();
+  });
+}
+
+async function sendDiscordAlert(target, options = {}) {
+  if (target.channel_type !== "discord") {
+    throw new Error("Only Discord webhook targets are supported for test sends.");
+  }
+
+  const productName = options.productName || target.name;
+  const retailer = options.retailer || target.retailer;
+  const timeAgo = options.timeAgo || "3 hours ago";
+  const headline = options.headline || `This product was dropped at ${retailer} ${timeAgo}. Keep up to date with us.`;
+
+  const content = [
+    headline,
+    `Product: ${productName}`,
+    `Link: ${target.product_url}`
+  ].join("\n");
+
+  return postJson(target.channel_value, { content });
+}
+
+function getDiscordWebhookForTarget(target) {
+  const targetWebhook = String(target.channel_value || "").trim();
+  if (targetWebhook) return targetWebhook;
+  return String(target.discord_webhook || "").trim();
+}
+
+function isValidDiscordWebhookUrl(value) {
+  const urlValue = String(value || "").trim();
+  if (!urlValue) return false;
+  try {
+    const parsed = new URL(urlValue);
+    if (parsed.protocol !== "https:") return false;
+    return parsed.hostname === "discord.com" && parsed.pathname.startsWith("/api/webhooks/");
+  } catch {
+    return false;
+  }
+}
+
+function getRequestClient(url) {
+  return url.startsWith("https:") ? https : http;
+}
+
+function fetchText(url, redirectCount = 0) {
+  return new Promise((resolve, reject) => {
+    const client = getRequestClient(url);
+    const req = client.get(url, {
+      headers: {
+        "User-Agent": "PokemonAlertsBot/1.0 (+https://railway.app)"
+      }
+    }, (res) => {
+      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location && redirectCount < 5) {
+        const nextUrl = new URL(res.headers.location, url).toString();
+        resolve(fetchText(nextUrl, redirectCount + 1));
+        return;
+      }
+
+      let body = "";
+      res.on("data", (chunk) => {
+        body += chunk;
+      });
+      res.on("end", () => {
+        if (res.statusCode >= 200 && res.statusCode < 300) {
+          resolve(body);
+          return;
+        }
+        reject(new Error(`Product page fetch failed with ${res.statusCode}`));
+      });
+    });
+
+    req.on("error", reject);
+    req.setTimeout(10000, () => {
+      req.destroy(new Error("Product page fetch timed out"));
+    });
+  });
+}
+
+function detectAvailability(html) {
+  const text = String(html || "").toLowerCase();
+  const inStockKeywords = [
+    "in stock",
+    "add to cart",
+    "available now",
+    "pickup available",
+    "ship it"
+  ];
+  const outOfStockKeywords = [
+    "out of stock",
+    "sold out",
+    "currently unavailable",
+    "not available"
+  ];
+
+  const hasInStock = inStockKeywords.some((keyword) => text.includes(keyword));
+  const hasOutOfStock = outOfStockKeywords.some((keyword) => text.includes(keyword));
+
+  if (hasInStock && !hasOutOfStock) return "in_stock";
+  if (hasOutOfStock && !hasInStock) return "out_of_stock";
+  return "unknown";
+}
+
+async function scanAlertTarget(target) {
+  try {
+    const html = await fetchText(target.product_url);
+    return {
+      status: detectAvailability(html),
+      error: null
+    };
+  } catch (err) {
+    return {
+      status: "unknown",
+      error: err
+    };
+  }
+}
+
+function formatTimeAgo(date) {
+  const diffMs = Date.now() - date.getTime();
+  const totalMinutes = Math.max(Math.round(diffMs / 60000), 0);
+  if (totalMinutes < 60) return `${totalMinutes} minutes ago`;
+  const totalHours = Math.round(totalMinutes / 60);
+  if (totalHours < 24) return `${totalHours} hours ago`;
+  const totalDays = Math.round(totalHours / 24);
+  return `${totalDays} days ago`;
+}
+
+async function runAutomatedScan(userId = null) {
+  const targets = db.prepare(`
+    SELECT t.*, u.discord_webhook
+    FROM alert_targets t
+    JOIN users u ON u.id = t.user_id
+    WHERE t.active = 1 AND t.channel_type = 'discord'
+      AND (? IS NULL OR t.user_id = ?)
+    ORDER BY t.id ASC
+  `).all(userId, userId);
+
+  for (const target of targets) {
+    const webhook = getDiscordWebhookForTarget(target);
+    const startedAt = new Date().toISOString();
+    const result = await scanAlertTarget(target);
+
+    db.prepare(`
+      UPDATE alert_targets
+      SET last_scan_status = ?, last_scan_at = ?
+      WHERE id = ?
+    `).run(result.status, startedAt, target.id);
+
+    if (result.error) {
+      console.error(`Scan failed for target ${target.id}:`, result.error.message);
+      continue;
+    }
+
+    if (!webhook) continue;
+    if (!isValidDiscordWebhookUrl(webhook)) {
+      console.error(`Skipping invalid Discord webhook for target ${target.id}`);
+      continue;
+    }
+    if (result.status !== "in_stock") continue;
+    if (target.last_scan_status === "in_stock") continue;
+
+    const syntheticTarget = { ...target, channel_value: webhook };
+    await sendDiscordAlert(syntheticTarget, { timeAgo: formatTimeAgo(new Date(startedAt)) });
+
+    db.prepare(`
+      UPDATE alert_targets
+      SET last_alerted_at = ?
+      WHERE id = ?
+    `).run(startedAt, target.id);
+
+    db.prepare(`
+      INSERT INTO alert_events (alert_target_id, user_id, event_type, event_message)
+      VALUES (?, ?, 'in_stock', ?)
+    `).run(target.id, target.user_id, `${target.name} in stock at ${target.retailer}`);
+  }
 }
 
 ensureOwnerSeeded();
@@ -327,6 +551,14 @@ app.get("/dashboard", requireAuth, (req, res) => {
   const user = ownerOverride(getUserById(req.auth.sub));
   const targets = db.prepare("SELECT * FROM alert_targets WHERE user_id = ? ORDER BY created_at DESC").all(user.id);
   const remaining = Math.max(user.alerts_quota - targets.length, 0);
+  const flash = String(req.query.flash || "").trim();
+  const message = String(req.query.message || "").trim();
+
+  const flashHtml = flash && message ? `
+    <div class="card">
+      <p class="${flash === "success" ? "success" : "danger"}">${escapeHtml(message)}</p>
+    </div>
+  ` : "";
 
   const rows = targets.length ? targets.map(t => `
     <tr>
@@ -335,15 +567,20 @@ app.get("/dashboard", requireAuth, (req, res) => {
       <td><a href="${t.product_url}" target="_blank" rel="noopener noreferrer">Open</a></td>
       <td>${t.channel_type}</td>
       <td>${t.active ? "Active" : "Paused"}</td>
+      <td>${t.last_scan_status || "unknown"}</td>
       <td>
+        <form method="post" action="/alerts/${t.id}/test" style="margin-bottom:8px;">
+          <button>Send Test Alert</button>
+        </form>
         <form method="post" action="/alerts/${t.id}/delete" onsubmit="return confirm('Delete this alert target?')">
           <button>Delete</button>
         </form>
       </td>
     </tr>`).join("")
-  : `<tr><td colspan="6" class="muted">No alert targets yet.</td></tr>`;
+  : `<tr><td colspan="7" class="muted">No alert targets yet.</td></tr>`;
 
   const body = `
+    ${flashHtml}
     <div class="grid">
       <div class="card">
         <h2>Account</h2>
@@ -353,6 +590,18 @@ app.get("/dashboard", requireAuth, (req, res) => {
         <p>Status: <span class="pill">${user.subscription_status}</span></p>
         <p>Quota remaining: ${remaining}</p>
         <a href="/pricing"><button>Change plan</button></a>
+      </div>
+      <div class="card">
+        <h2>Discord defaults</h2>
+        <p class="muted">Set a default webhook once. New and existing Discord targets can use this automatically.</p>
+        <form method="post" action="/settings/discord-webhook">
+          <label>Default Discord webhook</label>
+          <input name="discord_webhook" type="url" placeholder="https://discord.com/api/webhooks/..." value="${escapeHtml(user.discord_webhook || "")}" />
+          <div style="margin-top:16px;"><button>Save default webhook</button></div>
+        </form>
+        <form method="post" action="/alerts/scan-now" style="margin-top:12px;">
+          <button>Run automated scan now</button>
+        </form>
       </div>
       <div class="card">
         <h2>Add alert target</h2>
@@ -365,7 +614,7 @@ app.get("/dashboard", requireAuth, (req, res) => {
             <option value="discord">Discord webhook</option>
             <option value="email">Email placeholder</option>
           </select>
-          <label style="margin-top:12px; display:block;">Channel value</label><input name="channel_value" required placeholder="Discord webhook URL or email address" />
+          <label style="margin-top:12px; display:block;">Channel value</label><input name="channel_value" placeholder="Optional for Discord if default webhook is set" />
           <div style="margin-top:16px;"><button>Add target</button></div>
         </form>
       </div>
@@ -374,7 +623,7 @@ app.get("/dashboard", requireAuth, (req, res) => {
     <div class="card">
       <h2>Your alert targets</h2>
       <table>
-        <thead><tr><th>Name</th><th>Retailer</th><th>URL</th><th>Channel</th><th>Status</th><th>Action</th></tr></thead>
+        <thead><tr><th>Name</th><th>Retailer</th><th>URL</th><th>Channel</th><th>Status</th><th>Last scan</th><th>Action</th></tr></thead>
         <tbody>${rows}</tbody>
       </table>
     </div>
@@ -397,16 +646,72 @@ app.post("/alerts", requireAuth, (req, res) => {
     channel_value: String(req.body.channel_value || "").trim()
   };
 
-  if (!payload.name || !payload.retailer || !payload.product_url || !payload.channel_value) {
+  const fallbackWebhook = String(user.discord_webhook || "").trim();
+  if (!payload.name || !payload.retailer || !payload.product_url) {
     return res.status(400).send(renderPage("Invalid target", `<div class="card"><p class="danger">Fill in every field.</p><a href="/dashboard"><button>Back</button></a></div>`, user));
+  }
+  if (payload.channel_type === "discord" && !payload.channel_value && !fallbackWebhook) {
+    return res.status(400).send(renderPage("Invalid target", `<div class="card"><p class="danger">Add a channel value or set a default Discord webhook first.</p><a href="/dashboard"><button>Back</button></a></div>`, user));
+  }
+  const finalChannelValue = payload.channel_type === "discord" && !payload.channel_value
+    ? fallbackWebhook
+    : payload.channel_value;
+  if (payload.channel_type === "discord" && !isValidDiscordWebhookUrl(finalChannelValue)) {
+    return res.status(400).send(renderPage("Invalid target", `<div class="card"><p class="danger">Use a valid Discord webhook URL.</p><a href="/dashboard"><button>Back</button></a></div>`, user));
   }
 
   db.prepare(`
     INSERT INTO alert_targets (user_id, name, retailer, product_url, channel_type, channel_value, active)
     VALUES (?, ?, ?, ?, ?, ?, 1)
-  `).run(user.id, payload.name, payload.retailer, payload.product_url, payload.channel_type, payload.channel_value);
+  `).run(user.id, payload.name, payload.retailer, payload.product_url, payload.channel_type, finalChannelValue);
 
   res.redirect("/dashboard");
+});
+
+app.post("/settings/discord-webhook", requireAuth, (req, res) => {
+  const user = ownerOverride(getUserById(req.auth.sub));
+  const webhook = String(req.body.discord_webhook || "").trim();
+  if (webhook && !isValidDiscordWebhookUrl(webhook)) {
+    return res.redirect("/dashboard?flash=error&message=Please%20enter%20a%20valid%20Discord%20webhook%20URL");
+  }
+  db.prepare("UPDATE users SET discord_webhook = ? WHERE id = ?").run(webhook || null, user.id);
+  res.redirect("/dashboard?flash=success&message=Default%20Discord%20webhook%20saved");
+});
+
+app.post("/alerts/scan-now", requireAuth, async (req, res) => {
+  const user = ownerOverride(getUserById(req.auth.sub));
+  try {
+    await runAutomatedScan(user.id);
+    return res.redirect("/dashboard?flash=success&message=Automated%20scan%20completed");
+  } catch (err) {
+    console.error("Manual scan failed:", err);
+    return res.redirect("/dashboard?flash=error&message=Automated%20scan%20failed");
+  }
+});
+
+app.post("/alerts/:id/test", requireAuth, async (req, res) => {
+  const user = ownerOverride(getUserById(req.auth.sub));
+  const alertId = Number(req.params.id);
+  const target = db.prepare("SELECT * FROM alert_targets WHERE id = ? AND user_id = ?").get(alertId, user.id);
+
+  if (!target) {
+    return res.redirect("/dashboard?flash=error&message=Alert%20target%20not%20found");
+  }
+
+  try {
+    const webhook = getDiscordWebhookForTarget({ ...target, discord_webhook: user.discord_webhook });
+    if (!webhook) {
+      return res.redirect("/dashboard?flash=error&message=Missing%20Discord%20webhook%20for%20this%20target");
+    }
+    if (!isValidDiscordWebhookUrl(webhook)) {
+      return res.redirect("/dashboard?flash=error&message=Discord%20webhook%20URL%20is%20invalid");
+    }
+    await sendDiscordAlert({ ...target, channel_value: webhook }, { timeAgo: "3 hours ago" });
+    return res.redirect("/dashboard?flash=success&message=Test%20alert%20sent%20to%20Discord");
+  } catch (err) {
+    console.error("Test alert send failed:", err);
+    return res.redirect("/dashboard?flash=error&message=Discord%20test%20send%20failed");
+  }
 });
 
 app.post("/alerts/:id/delete", requireAuth, (req, res) => {
@@ -460,6 +765,19 @@ app.get("/health", (_req, res) => {
   res.json({ ok: true });
 });
 
+if (AUTO_SCAN_ENABLED) {
+  setInterval(() => {
+    runAutomatedScan().catch((err) => {
+      console.error("Automated scan failed:", err);
+    });
+  }, AUTO_SCAN_INTERVAL_MS);
+}
+
 app.listen(PORT, () => {
   console.log(`Pokemon Alerts SaaS running on ${APP_URL}`);
+  if (AUTO_SCAN_ENABLED) {
+    console.log(`Automated scans enabled every ${AUTO_SCAN_INTERVAL_MS}ms`);
+  } else {
+    console.log("Automated scans disabled");
+  }
 });
