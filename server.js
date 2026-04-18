@@ -11,6 +11,11 @@ const path = require("path");
 
 const { createDb } = require("./db");
 const { signAuthCookie, requireAuth } = require("./auth");
+const {
+  STATES,
+  shouldAlertTransition,
+  shouldAlertPriceDrop
+} = require("./packages/core/state-engine");
 
 const app = express();
 const db = createDb(path.join(__dirname, "app.db"));
@@ -931,6 +936,50 @@ app.post("/alerts/:id/delete", requireAuth, (req, res) => {
   const alertId = Number(req.params.id);
   db.prepare("DELETE FROM alert_targets WHERE id = ? AND user_id = ?").run(alertId, user.id);
   res.redirect("/dashboard");
+});
+
+app.post("/pokemoncenter/discovery/run", requireAuth, async (req, res) => {
+  try {
+    const count = await runPokemonCenterDiscovery();
+    return res.redirect(`/dashboard?flash=success&message=Pokemon%20Center%20discovery%20saved%20${count}%20urls`);
+  } catch (err) {
+    console.error("Pokemon Center discovery failed:", err);
+    return res.redirect("/dashboard?flash=error&message=Pokemon%20Center%20discovery%20failed");
+  }
+});
+
+app.post("/pokemoncenter/monitor/run", requireAuth, async (req, res) => {
+  try {
+    await runPokemonCenterMonitorCycle();
+    return res.redirect("/dashboard?flash=success&message=Pokemon%20Center%20monitor%20completed");
+  } catch (err) {
+    console.error("Pokemon Center monitor failed:", err);
+    return res.redirect("/dashboard?flash=error&message=Pokemon%20Center%20monitor%20failed");
+  }
+});
+
+app.post("/pokemoncenter/digest/send", requireAuth, async (_req, res) => {
+  try {
+    await sendPokemonCenterDigest();
+    return res.redirect("/dashboard?flash=success&message=Pokemon%20Center%206-hour%20digest%20sent");
+  } catch (err) {
+    console.error("Pokemon Center digest failed:", err);
+    return res.redirect("/dashboard?flash=error&message=Pokemon%20Center%20digest%20failed");
+  }
+});
+
+app.get("/pokemoncenter/feed", requireAuth, (_req, res) => {
+  const rows = db.prepare(`
+    SELECT e.created_at, p.canonical_name, po.product_url, e.old_state, e.new_state, e.old_price, e.new_price
+    FROM events e
+    JOIN product_offers po ON po.id = e.product_offer_id
+    JOIN products p ON p.id = po.product_id
+    JOIN retailers r ON r.id = po.retailer_id
+    WHERE r.adapter_key = 'pokemoncenter'
+    ORDER BY e.created_at DESC
+    LIMIT 100
+  `).all();
+  return res.json({ rows });
 });
 
 app.post("/create-checkout-session", requireAuth, async (req, res) => {

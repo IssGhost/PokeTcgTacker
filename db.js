@@ -49,6 +49,90 @@ function createDb(dbPath = "app.db") {
       FOREIGN KEY(alert_target_id) REFERENCES alert_targets(id),
       FOREIGN KEY(user_id) REFERENCES users(id)
     );
+
+    CREATE TABLE IF NOT EXISTS alert_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      alert_target_id INTEGER NOT NULL,
+      user_id INTEGER NOT NULL,
+      event_type TEXT NOT NULL,
+      event_message TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY(alert_target_id) REFERENCES alert_targets(id),
+      FOREIGN KEY(user_id) REFERENCES users(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS products (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      canonical_name TEXT NOT NULL,
+      set_name TEXT,
+      product_type TEXT,
+      image_url TEXT,
+      brand TEXT,
+      release_date TEXT,
+      canonical_slug TEXT UNIQUE,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS retailers (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT UNIQUE NOT NULL,
+      base_url TEXT,
+      adapter_key TEXT UNIQUE NOT NULL,
+      enabled INTEGER NOT NULL DEFAULT 1,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS product_offers (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      product_id INTEGER NOT NULL,
+      retailer_id INTEGER NOT NULL,
+      retailer_sku TEXT,
+      product_url TEXT NOT NULL UNIQUE,
+      last_seen_price REAL,
+      currency TEXT NOT NULL DEFAULT 'USD',
+      current_state TEXT NOT NULL DEFAULT 'UNKNOWN',
+      last_seen_at TEXT,
+      last_in_stock_at TEXT,
+      confidence_score REAL NOT NULL DEFAULT 0.5,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY(product_id) REFERENCES products(id),
+      FOREIGN KEY(retailer_id) REFERENCES retailers(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      product_offer_id INTEGER NOT NULL,
+      event_type TEXT NOT NULL,
+      old_state TEXT,
+      new_state TEXT,
+      old_price REAL,
+      new_price REAL,
+      raw_snapshot_hash TEXT,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY(product_offer_id) REFERENCES product_offers(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS monitor_runs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      adapter_key TEXT NOT NULL,
+      started_at TEXT NOT NULL,
+      finished_at TEXT,
+      status TEXT NOT NULL,
+      requests_made INTEGER NOT NULL DEFAULT 0,
+      errors_count INTEGER NOT NULL DEFAULT 0
+    );
+
+    CREATE TABLE IF NOT EXISTS watchlists (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL,
+      product_id INTEGER NOT NULL,
+      retailer_scope TEXT,
+      alert_channels TEXT,
+      price_cap REAL,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY(user_id) REFERENCES users(id),
+      FOREIGN KEY(product_id) REFERENCES products(id)
+    );
   `);
 
   if (!hasColumn("users", "discord_webhook")) {
