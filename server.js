@@ -272,23 +272,8 @@ function fetchText(url, redirectCount = 0) {
   });
 }
 
-function detectAvailability(html, pageUrl = "") {
+function detectAvailability(html) {
   const text = String(html || "").toLowerCase();
-  const isTargetPage = String(pageUrl || "").includes("target.com");
-
-  if (isTargetPage) {
-    const statusMatches = [...String(html || "").matchAll(/"availability_status"\s*:\s*"([A-Z_]+)"/g)];
-    const statusCounts = statusMatches.reduce((acc, match) => {
-      const key = String(match[1] || "");
-      acc[key] = (acc[key] || 0) + 1;
-      return acc;
-    }, {});
-
-    if ((statusCounts.IN_STOCK || 0) > 0) return "in_stock";
-    if ((statusCounts.PRE_ORDER || 0) > 0) return "pre_order";
-    if ((statusCounts.OUT_OF_STOCK || 0) > 0) return "out_of_stock";
-  }
-
   const inStockKeywords = [
     "in stock",
     "add to cart",
@@ -312,9 +297,9 @@ function detectAvailability(html, pageUrl = "") {
   const hasOutOfStock = outOfStockKeywords.some((keyword) => text.includes(keyword));
   const hasPreOrder = preOrderKeywords.some((keyword) => text.includes(keyword));
 
-  if (hasInStock) return "in_stock";
-  if (hasPreOrder) return "pre_order";
-  if (hasOutOfStock) return "out_of_stock";
+  if (hasInStock && !hasOutOfStock) return "in_stock";
+  if (hasPreOrder && !hasInStock) return "pre_order";
+  if (hasOutOfStock && !hasInStock) return "out_of_stock";
   return "unknown";
 }
 
@@ -322,7 +307,7 @@ async function scanAlertTarget(target) {
   try {
     const html = await fetchText(target.product_url);
     return {
-      status: detectAvailability(html, target.product_url),
+      status: detectAvailability(html),
       error: null
     };
   } catch (err) {
@@ -407,22 +392,10 @@ function buildTarget24hSummary(userId) {
     ORDER BY last_scan_at DESC
   `).all(userId);
 
-  const currentOutOfStock = db.prepare(`
-    SELECT id, name, retailer, product_url, last_scan_at
-    FROM alert_targets
-    WHERE user_id = ?
-      AND active = 1
-      AND channel_type = 'discord'
-      AND lower(retailer) LIKE '%target%'
-      AND last_scan_status = 'out_of_stock'
-    ORDER BY last_scan_at DESC
-  `).all(userId);
-
   return {
     recentEvents,
     currentInStock,
-    currentPreOrder,
-    currentOutOfStock
+    currentPreOrder
   };
 }
 
@@ -442,7 +415,6 @@ async function sendTarget24hUpdate(user) {
     `In-stock detections in last 24 hours: ${summary.recentEvents.length}`,
     `Currently in stock right now: ${summary.currentInStock.length}`,
     `Currently pre-order right now: ${summary.currentPreOrder.length}`,
-    `Currently out of stock right now: ${summary.currentOutOfStock.length}`,
     "",
     "Recent events:",
     ...(eventLines.length ? eventLines : ["- No in-stock events logged in last 24 hours"])
@@ -775,7 +747,6 @@ app.get("/dashboard", requireAuth, (req, res) => {
       <p><strong>In-stock detections (24h):</strong> ${targetSummary.recentEvents.length}</p>
       <p><strong>Current Target drops in stock right now:</strong> ${targetSummary.currentInStock.length}</p>
       <p><strong>Current Target drops in pre-order right now:</strong> ${targetSummary.currentPreOrder.length}</p>
-      <p><strong>Current Target drops out of stock right now:</strong> ${targetSummary.currentOutOfStock.length}</p>
       <ul>
         ${targetSummary.recentEvents.length
           ? targetSummary.recentEvents.slice(0, 10).map((event) => `<li>${escapeHtml(event.created_at)} — ${escapeHtml(event.name)} — <a href="${event.product_url}" target="_blank" rel="noopener noreferrer">Open</a></li>`).join("")
