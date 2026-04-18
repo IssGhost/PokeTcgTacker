@@ -7,7 +7,6 @@ const bcrypt = require("bcryptjs");
 const Stripe = require("stripe");
 const http = require("http");
 const https = require("https");
-const crypto = require("crypto");
 const path = require("path");
 
 const { createDb } = require("./db");
@@ -29,16 +28,6 @@ const APP_URL = process.env.APP_URL || `http://localhost:${PORT}`;
 const AUTO_SCAN_ENABLED = String(process.env.AUTO_SCAN_ENABLED || "true").toLowerCase() !== "false";
 const AUTO_SCAN_INTERVAL_MS = Math.max(Number(process.env.AUTO_SCAN_INTERVAL_MS || 300000), 30000);
 const AUTO_SEND_TARGET_UPDATES = String(process.env.AUTO_SEND_TARGET_UPDATES || "true").toLowerCase() !== "false";
-const POKEMON_CENTER_MONITOR_ENABLED = String(process.env.POKEMON_CENTER_MONITOR_ENABLED || "true").toLowerCase() !== "false";
-const POKEMON_CENTER_MONITOR_INTERVAL_MS = Math.max(Number(process.env.POKEMON_CENTER_MONITOR_INTERVAL_MS || 60000), 30000);
-const POKEMON_CENTER_DIGEST_INTERVAL_MS = Math.max(Number(process.env.POKEMON_CENTER_DIGEST_INTERVAL_MS || 21600000), 300000);
-const POKEMON_CENTER_DISCOVERY_URLS = String(
-  process.env.POKEMON_CENTER_DISCOVERY_URLS
-    || "https://www.pokemoncenter.com/sitemap.xml,https://www.pokemoncenter.com/category/trading-card-game,https://www.pokemoncenter.com/category/new-releases,https://www.pokemoncenter.com/category/preorder,https://www.pokemoncenter.com/category/back-in-stock"
-)
-  .split(",")
-  .map((url) => url.trim())
-  .filter(Boolean);
 
 const PLANS = {
   free: {
@@ -255,52 +244,6 @@ function getRequestClient(url) {
   return url.startsWith("https:") ? https : http;
 }
 
-function slugify(value) {
-  return String(value || "")
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/(^-|-$)/g, "")
-    .slice(0, 120);
-}
-
-function parseXmlLocEntries(xml) {
-  const matches = [...String(xml || "").matchAll(/<loc>([^<]+)<\/loc>/g)];
-  return matches.map((match) => String(match[1] || "").trim()).filter(Boolean);
-}
-
-function parseProductLinksFromHtml(html) {
-  const links = [...String(html || "").matchAll(/href="([^"]+)"/g)].map((match) => match[1]);
-  return links
-    .map((href) => {
-      try {
-        return new URL(href, "https://www.pokemoncenter.com").toString();
-      } catch {
-        return null;
-      }
-    })
-    .filter(Boolean)
-    .filter((url) => url.includes("/product/"));
-}
-
-function parseFirstPrice(text) {
-  const match = String(text || "").match(/\$([0-9]+(?:\.[0-9]{2})?)/);
-  if (!match) return null;
-  return Number(match[1]);
-}
-
-function detectPokemonCenterState(html) {
-  const text = String(html || "").toLowerCase();
-  if (text.includes("preorder: add to cart") || text.includes("preorder: add to basket")) {
-    return STATES.PREORDER_OPEN;
-  }
-  if (text.includes("coming soon")) return STATES.COMING_SOON;
-  if (text.includes("add to cart") || text.includes("add to basket")) return STATES.IN_STOCK;
-  if (text.includes("sold out") || text.includes("out of stock") || text.includes("currently unavailable")) {
-    return STATES.OUT_OF_STOCK;
-  }
-  return STATES.LISTED;
-}
-
 function fetchText(url, redirectCount = 0) {
   return new Promise((resolve, reject) => {
     const client = getRequestClient(url);
@@ -393,241 +336,6 @@ async function scanAlertTarget(target) {
       status: "unknown",
       error: err
     };
-  }
-}
-
-function ensureProductAndOffer(productUrl, title, price, state) {
-  const retailer = db.prepare("SELECT * FROM retailers WHERE adapter_key = 'pokemoncenter'").get();
-  const canonicalName = String(title || "Unknown Pokémon Center Product").trim();
-  const canonicalSlug = slugify(canonicalName) || slugify(productUrl);
-  let product = db.prepare("SELECT * FROM products WHERE canonical_slug = ?").get(canonicalSlug);
-  if (!product) {
-    const insert = db.prepare(`
-      INSERT INTO products (canonical_name, canonical_slug, brand)
-      VALUES (?, ?, 'Pokemon')
-    `).run(canonicalName, canonicalSlug);
-    product = db.prepare("SELECT * FROM products WHERE id = ?").get(insert.lastInsertRowid);
-  }
-
-  let offer = db.prepare("SELECT * FROM product_offers WHERE product_url = ?").get(productUrl);
-  if (!offer) {
-    const insert = db.prepare(`
-      INSERT INTO product_offers (product_id, retailer_id, product_url, last_seen_price, current_state, last_seen_at)
-      VALUES (?, ?, ?, ?, ?, ?)
-    `).run(product.id, retailer.id, productUrl, price, state, new Date().toISOString());
-    offer = db.prepare("SELECT * FROM product_offers WHERE id = ?").get(insert.lastInsertRowid);
-  }
-
-  return { product, offer };
-}
-
-async function sendPokemonCenterDiscordEvent(userId, event) {
-  const user = db.prepare("SELECT * FROM users WHERE id = ?").get(userId);
-  const webhook = String(user?.discord_webhook || "").trim();
-  if (!isValidDiscordWebhookUrl(webhook)) return;
-
-  const content = [
-    `Pokémon Center ${event.newState}: ${event.productName}`,
-    `URL: ${event.productUrl}`,
-    `Price: ${event.newPrice == null ? "N/A" : `$${event.newPrice.toFixed(2)}`}`,
-    `Transition: ${event.oldState || STATES.UNKNOWN} -> ${event.newState}`
-  ].join("\n");
-
-  await postJson(webhook, { content });
-}
-
-async function monitorPokemonCenterProduct(productUrl) {
-  const html = await fetchText(productUrl);
-  const titleMatch = html.match(/<title>([^<]+)<\/title>/i);
-  const title = titleMatch ? titleMatch[1].replace(/\s*\|\s*Pokémon Center\s*$/i, "").trim() : "Pokémon Center Product";
-  const state = detectPokemonCenterState(html);
-  const price = parseFirstPrice(html);
-  const snapshotHash = crypto.createHash("sha1").update(html).digest("hex");
-  const nowIso = new Date().toISOString();
-
-  const { product, offer } = ensureProductAndOffer(productUrl, title, price, state);
-  const oldState = offer.current_state || STATES.UNKNOWN;
-  const oldPrice = typeof offer.last_seen_price === "number" ? offer.last_seen_price : null;
-
-  db.prepare(`
-    UPDATE product_offers
-    SET last_seen_price = ?,
-        current_state = ?,
-        last_seen_at = ?,
-        last_in_stock_at = CASE WHEN ? = ? THEN ? ELSE last_in_stock_at END
-    WHERE id = ?
-  `).run(price, state, nowIso, state, STATES.IN_STOCK, nowIso, offer.id);
-
-  const transitioned = shouldAlertTransition(oldState, state);
-  const droppedPrice = shouldAlertPriceDrop(oldPrice, price, 7);
-
-  if (transitioned || droppedPrice) {
-    db.prepare(`
-      INSERT INTO events (product_offer_id, event_type, old_state, new_state, old_price, new_price, raw_snapshot_hash)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
-    `).run(
-      offer.id,
-      droppedPrice && !transitioned ? STATES.PRICE_CHANGED : "STATE_CHANGED",
-      oldState,
-      state,
-      oldPrice,
-      price,
-      snapshotHash
-    );
-  }
-
-  return {
-    product,
-    offerId: offer.id,
-    state,
-    oldState,
-    price,
-    oldPrice,
-    transitioned,
-    droppedPrice,
-    snapshotHash
-  };
-}
-
-async function discoverPokemonCenterProductUrls() {
-  const found = new Set();
-
-  for (const sourceUrl of POKEMON_CENTER_DISCOVERY_URLS) {
-    try {
-      const payload = await fetchText(sourceUrl);
-      const urls = sourceUrl.endsWith(".xml")
-        ? parseXmlLocEntries(payload)
-        : parseProductLinksFromHtml(payload);
-      urls.forEach((url) => {
-        if (url.includes("pokemoncenter.com") && url.includes("/product/")) {
-          found.add(url.split("?")[0]);
-        }
-      });
-    } catch (err) {
-      console.error(`Pokemon Center discovery failed for ${sourceUrl}:`, err.message);
-    }
-  }
-
-  return [...found];
-}
-
-async function runPokemonCenterDiscovery() {
-  const urls = await discoverPokemonCenterProductUrls();
-  for (const url of urls) {
-    ensureProductAndOffer(url, "Pokemon Center Listing", null, STATES.LISTED);
-  }
-  return urls.length;
-}
-
-function sixHoursAgoIso() {
-  return new Date(Date.now() - 6 * 60 * 60 * 1000).toISOString();
-}
-
-async function sendPokemonCenterDigest() {
-  const users = db.prepare(`
-    SELECT id, discord_webhook
-    FROM users
-    WHERE discord_webhook IS NOT NULL AND trim(discord_webhook) != ''
-  `).all();
-  const since = sixHoursAgoIso();
-
-  const counts = db.prepare(`
-    SELECT event_type, COUNT(*) AS c
-    FROM events
-    WHERE created_at >= ?
-    GROUP BY event_type
-  `).all(since);
-  const stateChanged = counts.find((row) => row.event_type === "STATE_CHANGED")?.c || 0;
-  const priceChanged = counts.find((row) => row.event_type === STATES.PRICE_CHANGED)?.c || 0;
-  const monitorRuns = db.prepare("SELECT COUNT(*) AS c FROM monitor_runs WHERE started_at >= ?").get(since).c;
-  const topItems = db.prepare(`
-    SELECT p.canonical_name, COUNT(*) AS c
-    FROM events e
-    JOIN product_offers po ON po.id = e.product_offer_id
-    JOIN products p ON p.id = po.product_id
-    WHERE e.created_at >= ?
-    GROUP BY p.canonical_name
-    ORDER BY c DESC
-    LIMIT 5
-  `).all(since);
-  const topLines = topItems.length
-    ? topItems.map((item, idx) => `${idx + 1}. ${item.canonical_name} (${item.c})`).join("\n")
-    : "No events in the last 6 hours";
-
-  for (const user of users) {
-    if (!isValidDiscordWebhookUrl(user.discord_webhook)) continue;
-    const content = [
-      "Pokémon Center 6-hour digest",
-      `Monitor runs: ${monitorRuns}`,
-      `State-change alerts: ${stateChanged}`,
-      `Price-change alerts: ${priceChanged}`,
-      "Top items:",
-      topLines
-    ].join("\n");
-    await postJson(user.discord_webhook, { content });
-  }
-}
-
-async function runPokemonCenterMonitorCycle() {
-  const startedAt = new Date().toISOString();
-  const runInsert = db.prepare(`
-    INSERT INTO monitor_runs (adapter_key, started_at, status, requests_made, errors_count)
-    VALUES ('pokemoncenter', ?, 'running', 0, 0)
-  `).run(startedAt);
-
-  let requestsMade = 0;
-  let errorsCount = 0;
-  try {
-    const discoveryCount = await runPokemonCenterDiscovery();
-    const offers = db.prepare(`
-      SELECT po.id, po.product_url
-      FROM product_offers po
-      JOIN retailers r ON r.id = po.retailer_id
-      WHERE r.adapter_key = 'pokemoncenter'
-      ORDER BY po.id DESC
-      LIMIT 200
-    `).all();
-
-    for (const offer of offers) {
-      try {
-        const result = await monitorPokemonCenterProduct(offer.product_url);
-        requestsMade += 1;
-        if (result.transitioned || result.droppedPrice) {
-          const watchers = db.prepare(`
-            SELECT DISTINCT w.user_id
-            FROM watchlists w
-            JOIN products p ON p.id = w.product_id
-            JOIN product_offers po ON po.product_id = p.id
-            WHERE po.id = ?
-          `).all(result.offerId);
-          for (const watcher of watchers) {
-            await sendPokemonCenterDiscordEvent(watcher.user_id, {
-              productName: result.product.canonical_name,
-              productUrl: offer.product_url,
-              newPrice: result.price,
-              oldState: result.oldState,
-              newState: result.state
-            });
-          }
-        }
-      } catch (err) {
-        errorsCount += 1;
-        console.error(`Pokemon Center monitor failed for ${offer.product_url}:`, err.message);
-      }
-    }
-
-    db.prepare(`
-      UPDATE monitor_runs
-      SET finished_at = ?, status = 'ok', requests_made = ?, errors_count = ?
-      WHERE id = ?
-    `).run(new Date().toISOString(), requestsMade + discoveryCount, errorsCount, runInsert.lastInsertRowid);
-  } catch (err) {
-    db.prepare(`
-      UPDATE monitor_runs
-      SET finished_at = ?, status = 'failed', requests_made = ?, errors_count = ?
-      WHERE id = ?
-    `).run(new Date().toISOString(), requestsMade, errorsCount + 1, runInsert.lastInsertRowid);
-    throw err;
   }
 }
 
@@ -1065,19 +773,6 @@ app.get("/dashboard", requireAuth, (req, res) => {
         </form>
       </div>
       <div class="card">
-        <h2>Pokémon Center MVP tools</h2>
-        <p class="muted">Phase 1 runtime: discovery + monitor + digest.</p>
-        <form method="post" action="/pokemoncenter/discovery/run">
-          <button>Run Pokémon Center discovery</button>
-        </form>
-        <form method="post" action="/pokemoncenter/monitor/run" style="margin-top:12px;">
-          <button>Run Pokémon Center monitor</button>
-        </form>
-        <form method="post" action="/pokemoncenter/digest/send" style="margin-top:12px;">
-          <button>Send Pokémon Center 6h digest now</button>
-        </form>
-      </div>
-      <div class="card">
         <h2>Add alert target</h2>
         <form method="post" action="/alerts">
           <label>Name</label><input name="name" required placeholder="Journey Together ETB" />
@@ -1345,24 +1040,6 @@ if (AUTO_SCAN_ENABLED) {
   }, AUTO_SCAN_INTERVAL_MS);
 }
 
-if (POKEMON_CENTER_MONITOR_ENABLED) {
-  setInterval(async () => {
-    try {
-      await runPokemonCenterMonitorCycle();
-    } catch (err) {
-      console.error("Pokemon Center automated monitor failed:", err);
-    }
-  }, POKEMON_CENTER_MONITOR_INTERVAL_MS);
-
-  setInterval(async () => {
-    try {
-      await sendPokemonCenterDigest();
-    } catch (err) {
-      console.error("Pokemon Center automated digest failed:", err);
-    }
-  }, POKEMON_CENTER_DIGEST_INTERVAL_MS);
-}
-
 app.listen(PORT, () => {
   console.log(`Pokemon Alerts SaaS running on ${APP_URL}`);
   if (AUTO_SCAN_ENABLED) {
@@ -1370,11 +1047,5 @@ app.listen(PORT, () => {
     console.log(`Automated Target updates every interval: ${AUTO_SEND_TARGET_UPDATES ? "on" : "off"}`);
   } else {
     console.log("Automated scans disabled");
-  }
-  if (POKEMON_CENTER_MONITOR_ENABLED) {
-    console.log(`Pokemon Center monitor enabled every ${POKEMON_CENTER_MONITOR_INTERVAL_MS}ms`);
-    console.log(`Pokemon Center digest enabled every ${POKEMON_CENTER_DIGEST_INTERVAL_MS}ms`);
-  } else {
-    console.log("Pokemon Center monitor disabled");
   }
 });
