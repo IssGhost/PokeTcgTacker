@@ -21,7 +21,8 @@ const stripe = stripeKey ? new Stripe(stripeKey) : null;
 const PORT = process.env.PORT || 3000;
 const APP_URL = process.env.APP_URL || `http://localhost:${PORT}`;
 const AUTO_SCAN_ENABLED = String(process.env.AUTO_SCAN_ENABLED || "true").toLowerCase() !== "false";
-const AUTO_SCAN_INTERVAL_MS = Math.max(Number(process.env.AUTO_SCAN_INTERVAL_MS || 180000), 30000);
+const AUTO_SCAN_INTERVAL_MS = Math.max(Number(process.env.AUTO_SCAN_INTERVAL_MS || 300000), 30000);
+const AUTO_SEND_TARGET_UPDATES = String(process.env.AUTO_SEND_TARGET_UPDATES || "true").toLowerCase() !== "false";
 
 const PLANS = {
   free: {
@@ -272,8 +273,23 @@ function fetchText(url, redirectCount = 0) {
   });
 }
 
-function detectAvailability(html) {
+function detectAvailability(html, pageUrl = "") {
   const text = String(html || "").toLowerCase();
+  const isTargetPage = String(pageUrl || "").includes("target.com");
+
+  if (isTargetPage) {
+    const statusMatches = [...String(html || "").matchAll(/"availability_status"\s*:\s*"([A-Z_]+)"/g)];
+    const statusCounts = statusMatches.reduce((acc, match) => {
+      const key = String(match[1] || "");
+      acc[key] = (acc[key] || 0) + 1;
+      return acc;
+    }, {});
+
+    if ((statusCounts.IN_STOCK || 0) > 0) return "in_stock";
+    if ((statusCounts.PRE_ORDER || 0) > 0) return "pre_order";
+    if ((statusCounts.OUT_OF_STOCK || 0) > 0) return "out_of_stock";
+  }
+
   const inStockKeywords = [
     "in stock",
     "add to cart",
@@ -297,9 +313,9 @@ function detectAvailability(html) {
   const hasOutOfStock = outOfStockKeywords.some((keyword) => text.includes(keyword));
   const hasPreOrder = preOrderKeywords.some((keyword) => text.includes(keyword));
 
-  if (hasInStock && !hasOutOfStock) return "in_stock";
-  if (hasPreOrder && !hasInStock) return "pre_order";
-  if (hasOutOfStock && !hasInStock) return "out_of_stock";
+  if (hasInStock) return "in_stock";
+  if (hasPreOrder) return "pre_order";
+  if (hasOutOfStock) return "out_of_stock";
   return "unknown";
 }
 
@@ -307,7 +323,7 @@ async function scanAlertTarget(target) {
   try {
     const html = await fetchText(target.product_url);
     return {
-      status: detectAvailability(html),
+      status: detectAvailability(html, target.product_url),
       error: null
     };
   } catch (err) {
@@ -392,10 +408,22 @@ function buildTarget24hSummary(userId) {
     ORDER BY last_scan_at DESC
   `).all(userId);
 
+  const currentOutOfStock = db.prepare(`
+    SELECT id, name, retailer, product_url, last_scan_at
+    FROM alert_targets
+    WHERE user_id = ?
+      AND active = 1
+      AND channel_type = 'discord'
+      AND lower(retailer) LIKE '%target%'
+      AND last_scan_status = 'out_of_stock'
+    ORDER BY last_scan_at DESC
+  `).all(userId);
+
   return {
     recentEvents,
     currentInStock,
-    currentPreOrder
+    currentPreOrder,
+    currentOutOfStock
   };
 }
 
@@ -415,12 +443,34 @@ async function sendTarget24hUpdate(user) {
     `In-stock detections in last 24 hours: ${summary.recentEvents.length}`,
     `Currently in stock right now: ${summary.currentInStock.length}`,
     `Currently pre-order right now: ${summary.currentPreOrder.length}`,
+    `Currently out of stock right now: ${summary.currentOutOfStock.length}`,
     "",
     "Recent events:",
     ...(eventLines.length ? eventLines : ["- No in-stock events logged in last 24 hours"])
   ].join("\n");
 
   return postJson(webhook, { content });
+}
+
+async function sendAutomatedTargetUpdates() {
+  const users = db.prepare(`
+    SELECT id, discord_webhook
+    FROM users
+    WHERE discord_webhook IS NOT NULL
+      AND trim(discord_webhook) != ''
+  `).all();
+
+  for (const userRecord of users) {
+    if (!isValidDiscordWebhookUrl(userRecord.discord_webhook)) {
+      continue;
+    }
+
+    try {
+      await sendTarget24hUpdate(userRecord);
+    } catch (err) {
+      console.error(`Automated Target update failed for user ${userRecord.id}:`, err.message);
+    }
+  }
 }
 
 async function runAutomatedScan(userId = null, options = {}) {
@@ -747,6 +797,7 @@ app.get("/dashboard", requireAuth, (req, res) => {
       <p><strong>In-stock detections (24h):</strong> ${targetSummary.recentEvents.length}</p>
       <p><strong>Current Target drops in stock right now:</strong> ${targetSummary.currentInStock.length}</p>
       <p><strong>Current Target drops in pre-order right now:</strong> ${targetSummary.currentPreOrder.length}</p>
+      <p><strong>Current Target drops out of stock right now:</strong> ${targetSummary.currentOutOfStock.length}</p>
       <ul>
         ${targetSummary.recentEvents.length
           ? targetSummary.recentEvents.slice(0, 10).map((event) => `<li>${escapeHtml(event.created_at)} — ${escapeHtml(event.name)} — <a href="${event.product_url}" target="_blank" rel="noopener noreferrer">Open</a></li>`).join("")
@@ -927,10 +978,16 @@ app.get("/health", (_req, res) => {
 });
 
 if (AUTO_SCAN_ENABLED) {
-  setInterval(() => {
-    runAutomatedScan(null, { targetOnly: true }).catch((err) => {
+  setInterval(async () => {
+    try {
+      await runAutomatedScan(null, { targetOnly: true });
+    } catch (err) {
       console.error("Automated scan failed:", err);
-    });
+    } finally {
+      if (AUTO_SEND_TARGET_UPDATES) {
+        await sendAutomatedTargetUpdates();
+      }
+    }
   }, AUTO_SCAN_INTERVAL_MS);
 }
 
@@ -938,6 +995,7 @@ app.listen(PORT, () => {
   console.log(`Pokemon Alerts SaaS running on ${APP_URL}`);
   if (AUTO_SCAN_ENABLED) {
     console.log(`Automated scans enabled every ${AUTO_SCAN_INTERVAL_MS}ms`);
+    console.log(`Automated Target updates every interval: ${AUTO_SEND_TARGET_UPDATES ? "on" : "off"}`);
   } else {
     console.log("Automated scans disabled");
   }
