@@ -82,15 +82,51 @@ function renderPage(title, body, user = null) {
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>${title}</title>
     <style>
-      body { font-family: Arial, sans-serif; margin: 0; background: #0b1020; color: #eef2ff; }
-      .wrap { max-width: 1080px; margin: 0 auto; padding: 24px; }
-      .nav { display:flex; gap:16px; align-items:center; padding:16px 24px; background:#111933; border-bottom:1px solid #22305e; }
+      :root {
+        --bg: #070b14;
+        --panel: rgba(18, 27, 53, 0.88);
+        --border: #293a70;
+        --text: #eef2ff;
+        --muted: #b4c2e5;
+        --accent: #4f7cff;
+      }
+      body {
+        font-family: Inter, Arial, sans-serif;
+        margin: 0;
+        background:
+          radial-gradient(circle at 10% 10%, rgba(79,124,255,0.2), transparent 35%),
+          linear-gradient(180deg, #060a13, #0b1020 45%, #0b1326);
+        color: var(--text);
+      }
+      .wrap { max-width: 1180px; margin: 0 auto; padding: 24px; }
+      .nav {
+        display:flex; gap:16px; align-items:center; padding:16px 24px;
+        background: rgba(10,16,33,0.92);
+        backdrop-filter: blur(6px);
+        border-bottom:1px solid var(--border);
+        position: sticky; top: 0; z-index: 10;
+      }
       .nav a, .linkbutton { color:#cfe1ff; text-decoration:none; background:none; border:none; cursor:pointer; font:inherit; padding:0; }
-      .hero, .card { background:#111933; border:1px solid #22305e; border-radius:16px; padding:24px; margin-top:20px; }
+      .hero, .card {
+        background: var(--panel);
+        border:1px solid var(--border);
+        border-radius:16px;
+        padding:24px;
+        margin-top:20px;
+        box-shadow: 0 8px 30px rgba(0,0,0,0.25);
+      }
+      .hero {
+        background-image:
+          linear-gradient(115deg, rgba(10,15,35,0.95), rgba(10,15,35,0.7)),
+          url('https://images.unsplash.com/photo-1613771404784-3a5686aa2be3?auto=format&fit=crop&w=1400&q=80');
+        background-size: cover;
+        background-position: center;
+      }
       .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(280px,1fr)); gap:16px; }
       input, select, textarea { width:100%; padding:12px; border-radius:10px; border:1px solid #34467d; background:#0a1430; color:#eef2ff; }
-      button { background:#4f7cff; color:white; border:none; padding:12px 16px; border-radius:10px; cursor:pointer; font-weight:600; }
-      .muted { color:#b4c2e5; }
+      button { background:var(--accent); color:white; border:none; padding:12px 16px; border-radius:10px; cursor:pointer; font-weight:600; }
+      button:hover { filter: brightness(1.08); }
+      .muted { color:var(--muted); }
       .success { color:#9ff7b4; }
       .danger { color:#ffb7b7; }
       table { width:100%; border-collapse:collapse; margin-top:16px; }
@@ -122,6 +158,13 @@ function getUserAlertPreferences(userId) {
     prefs = db.prepare("SELECT * FROM user_alert_preferences WHERE user_id = ?").get(userId);
   }
   return prefs;
+}
+
+function logNotification(userId, channel, message, status = "queued") {
+  db.prepare(`
+    INSERT INTO notification_logs (user_id, channel, message, status)
+    VALUES (?, ?, ?, ?)
+  `).run(userId, channel, message, status);
 }
 
 function currentUser(req) {
@@ -448,8 +491,8 @@ function ensureProductAndOffer(productUrl, title, price, state, retailerKey = "p
 
 async function sendPokemonCenterDiscordEvent(userId, event) {
   const user = db.prepare("SELECT * FROM users WHERE id = ?").get(userId);
+  const prefs = getUserAlertPreferences(userId);
   const webhook = String(user?.discord_webhook || "").trim();
-  if (!isValidDiscordWebhookUrl(webhook)) return;
 
   const content = [
     `Pokémon Center ${event.newState}: ${event.productName}`,
@@ -458,7 +501,20 @@ async function sendPokemonCenterDiscordEvent(userId, event) {
     `Transition: ${event.oldState || STATES.UNKNOWN} -> ${event.newState}`
   ].join("\n");
 
-  await postJson(webhook, { content });
+  if (prefs.discord_enabled && isValidDiscordWebhookUrl(webhook)) {
+    await postJson(webhook, { content });
+    logNotification(userId, "discord", content, "sent");
+  }
+
+  if (prefs.email_enabled) {
+    // Phase 4 placeholder; replace with provider integration when keys are configured.
+    logNotification(userId, "email", content, "queued");
+  }
+
+  if (prefs.sms_enabled) {
+    // Phase 4 placeholder; replace with provider integration when keys are configured.
+    logNotification(userId, "sms", content, "queued");
+  }
 }
 
 async function monitorPokemonCenterProduct(productUrl) {
@@ -1164,6 +1220,19 @@ app.get("/dashboard", requireAuth, (req, res) => {
     ORDER BY started_at DESC
     LIMIT 8
   `).all();
+  const marketRows = db.prepare(`
+    SELECT product_name, source_name, price, url, captured_at
+    FROM market_snapshots
+    ORDER BY captured_at DESC
+    LIMIT 6
+  `).all();
+  const notificationRows = db.prepare(`
+    SELECT channel, status, created_at
+    FROM notification_logs
+    WHERE user_id = ?
+    ORDER BY created_at DESC
+    LIMIT 6
+  `).all(user.id);
   const remaining = Math.max(user.alerts_quota - targets.length, 0);
   const flash = String(req.query.flash || "").trim();
   const message = String(req.query.message || "").trim();
@@ -1334,6 +1403,30 @@ app.get("/dashboard", requireAuth, (req, res) => {
             : "<li class=\"muted\">No monitor runs yet.</li>"}
         </ul>
         <a href="/health/dashboard"><button>Open health dashboard</button></a>
+      </div>
+      <div class="card">
+        <h2>Market watch (Phase 4)</h2>
+        <p class="muted">Optional market-price lane, separated from live retail alerts.</p>
+        <ul>
+          ${marketRows.length
+            ? marketRows.map((row) => `<li>${escapeHtml(row.product_name)} — ${escapeHtml(row.source_name)} — ${row.price == null ? "N/A" : `$${Number(row.price).toFixed(2)}`}</li>`).join("")
+            : "<li class=\"muted\">No market snapshots yet.</li>"}
+        </ul>
+        <p class="muted" style="margin-top:12px;">Recent notification activity</p>
+        <ul>
+          ${notificationRows.length
+            ? notificationRows.map((row) => `<li>${escapeHtml(row.channel)} — ${escapeHtml(row.status)} — ${escapeHtml(row.created_at)}</li>`).join("")
+            : "<li class=\"muted\">No notifications logged yet.</li>"}
+        </ul>
+        ${user.role === "owner" ? `
+          <form method="post" action="/market/snapshot" style="margin-top:12px;">
+            <label>Product</label><input name="product_name" required placeholder="Prismatic Evolutions ETB" />
+            <label style="margin-top:8px; display:block;">Source</label><input name="source_name" required placeholder="TCGPlayer" />
+            <label style="margin-top:8px; display:block;">Price</label><input name="price" type="number" step="0.01" />
+            <label style="margin-top:8px; display:block;">URL</label><input name="url" type="url" />
+            <div style="margin-top:10px;"><button>Save market snapshot</button></div>
+          </form>
+        ` : ""}
       </div>
     </div>
   `;
@@ -1584,6 +1677,42 @@ app.get("/retail/feed", requireAuth, (_req, res) => {
     LIMIT 100
   `).all();
   return res.json({ rows });
+});
+
+app.post("/market/snapshot", requireAuth, (req, res) => {
+  const user = ownerOverride(getUserById(req.auth.sub));
+  if (user.role !== "owner") {
+    return res.status(403).send("Forbidden");
+  }
+
+  const productName = String(req.body.product_name || "").trim();
+  const sourceName = String(req.body.source_name || "").trim();
+  const priceRaw = String(req.body.price || "").trim();
+  const url = String(req.body.url || "").trim();
+  const price = priceRaw ? Number(priceRaw) : null;
+  if (!productName || !sourceName) {
+    return res.redirect("/dashboard?flash=error&message=Market%20snapshot%20requires%20product%20and%20source");
+  }
+
+  db.prepare(`
+    INSERT INTO market_snapshots (product_name, source_name, price, url)
+    VALUES (?, ?, ?, ?)
+  `).run(productName, sourceName, Number.isFinite(price) ? price : null, url || null);
+
+  return res.redirect("/dashboard?flash=success&message=Market%20snapshot%20saved");
+});
+
+app.get("/api/public/feed", (_req, res) => {
+  const events = db.prepare(`
+    SELECT e.created_at, r.name AS retailer, p.canonical_name, po.product_url, e.new_state, e.new_price
+    FROM events e
+    JOIN product_offers po ON po.id = e.product_offer_id
+    JOIN products p ON p.id = po.product_id
+    JOIN retailers r ON r.id = po.retailer_id
+    ORDER BY e.created_at DESC
+    LIMIT 50
+  `).all();
+  return res.json({ events, generated_at: new Date().toISOString() });
 });
 
 app.get("/calendar", requireAuth, (req, res) => {
