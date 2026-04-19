@@ -38,6 +38,7 @@ const {
   recordSuppression,
   recordPipelineTrace
 } = require("./services/ingestion-visibility");
+const { LAST_10_RELEASED_SETS, PRODUCT_TYPE_TERMS, buildCatalogQueries } = require("./services/set-catalog");
 
 const app = express();
 const db = createDb(path.join(__dirname, "..", "app.db"));
@@ -64,6 +65,12 @@ const POKEMON_CENTER_DISCOVERY_URLS = String(
   .split(",")
   .map((url) => url.trim())
   .filter(Boolean);
+const SAMPLE_TARGET_URLS = [
+  "https://www.target.com/p/pok-233-mon-trading-card-game-scarlet-38-violet-8212-destined-rivals-booster-bundle/-/A-94300067",
+  "https://www.target.com/p/2025-pokemon-scarlet-violet-s9-3pk-bl-version-1/-/A-93859728",
+  "https://www.target.com/p/pok-233-mon-trading-card-game-scarlet-38-violet-8212-destined-rivals-elite-trainer-box/-/A-94300069",
+  "https://www.target.com/p/pok-mon-tcg-mega-evolution-ascended-heroes-elite-trainer-box/-/A-1010148053"
+];
 
 const PLANS = {
   free: {
@@ -106,56 +113,65 @@ function renderPage(title, body, user = null) {
     <title>${title}</title>
     <style>
       :root {
-        --bg: #070b14;
-        --panel: rgba(18, 27, 53, 0.88);
-        --border: #293a70;
+        --bg: #050816;
+        --panel: rgba(17, 23, 48, 0.78);
+        --panel-2: rgba(31, 18, 72, 0.72);
+        --border: #2e3f79;
         --text: #eef2ff;
-        --muted: #b4c2e5;
-        --accent: #4f7cff;
+        --muted: #a8b6de;
+        --accent: #7b5cff;
+        --accent-2: #21d4fd;
       }
       body {
-        font-family: Inter, Arial, sans-serif;
+        font-family: Inter, "Segoe UI", Arial, sans-serif;
         margin: 0;
         background:
-          radial-gradient(circle at 10% 10%, rgba(79,124,255,0.2), transparent 35%),
-          linear-gradient(180deg, #060a13, #0b1020 45%, #0b1326);
+          radial-gradient(circle at 15% 12%, rgba(123,92,255,0.28), transparent 40%),
+          radial-gradient(circle at 85% 3%, rgba(33,212,253,0.16), transparent 30%),
+          linear-gradient(180deg, #050714, #0b1023 45%, #0a1228 100%);
         color: var(--text);
       }
-      .wrap { max-width: 1180px; margin: 0 auto; padding: 24px; }
+      .wrap { max-width: 1320px; margin: 0 auto; padding: 24px; }
       .nav {
         display:flex; gap:16px; align-items:center; padding:16px 24px;
-        background: rgba(10,16,33,0.92);
-        backdrop-filter: blur(6px);
+        background: rgba(10,16,33,0.84);
+        backdrop-filter: blur(10px);
         border-bottom:1px solid var(--border);
         position: sticky; top: 0; z-index: 10;
       }
-      .nav a, .linkbutton { color:#cfe1ff; text-decoration:none; background:none; border:none; cursor:pointer; font:inherit; padding:0; }
+      .nav a, .linkbutton { color:#d5e3ff; text-decoration:none; background:none; border:none; cursor:pointer; font:inherit; padding:0; }
       .hero, .card {
         background: var(--panel);
         border:1px solid var(--border);
-        border-radius:16px;
+        border-radius:18px;
         padding:24px;
         margin-top:20px;
-        box-shadow: 0 8px 30px rgba(0,0,0,0.25);
+        box-shadow: 0 10px 35px rgba(0,0,0,0.26);
       }
       .hero {
         background-image:
-          linear-gradient(115deg, rgba(10,15,35,0.95), rgba(10,15,35,0.7)),
+          linear-gradient(115deg, rgba(11,17,40,0.95), rgba(16,19,53,0.76)),
           url('https://images.unsplash.com/photo-1613771404784-3a5686aa2be3?auto=format&fit=crop&w=1400&q=80');
         background-size: cover;
         background-position: center;
       }
-      .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(280px,1fr)); gap:16px; }
-      input, select, textarea { width:100%; padding:12px; border-radius:10px; border:1px solid #34467d; background:#0a1430; color:#eef2ff; }
-      button { background:var(--accent); color:white; border:none; padding:12px 16px; border-radius:10px; cursor:pointer; font-weight:600; }
-      button:hover { filter: brightness(1.08); }
+      .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(300px,1fr)); gap:18px; }
+      input, select, textarea {
+        width:100%; padding:12px; border-radius:12px; border:1px solid #3b4f89;
+        background: rgba(8,14,35,0.85); color:#eef2ff;
+      }
+      button {
+        background: linear-gradient(90deg, var(--accent), var(--accent-2));
+        color:white; border:none; padding:12px 16px; border-radius:12px; cursor:pointer; font-weight:700;
+      }
+      button:hover { filter: brightness(1.06); transform: translateY(-1px); }
       .muted { color:var(--muted); }
       .success { color:#9ff7b4; }
       .danger { color:#ffb7b7; }
       table { width:100%; border-collapse:collapse; margin-top:16px; }
       th, td { text-align:left; padding:10px; border-bottom:1px solid #22305e; }
       ul { padding-left:18px; }
-      .pill { display:inline-block; padding:6px 10px; border-radius:999px; background:#22305e; font-size:12px; }
+      .pill { display:inline-block; padding:6px 10px; border-radius:999px; background:rgba(86,65,176,0.45); font-size:12px; border:1px solid #5641b0; }
     </style>
   </head>
   <body>
@@ -243,6 +259,31 @@ function ensureOwnerSeeded() {
     INSERT INTO users (email, password_hash, role, subscription_tier, subscription_status, alerts_quota)
     VALUES (?, ?, 'owner', 'pro', 'active', 999999)
   `).run(email, hash);
+}
+
+function ensureReleasedSetCatalogSeeded() {
+  const insertRelease = db.prepare(`
+    INSERT OR IGNORE INTO release_calendar (title, set_name, release_date, notes, source_url, created_by_user_id)
+    VALUES (?, ?, ?, ?, ?, NULL)
+  `);
+  const insertProduct = db.prepare(`
+    INSERT OR IGNORE INTO products (canonical_name, set_name, product_type, brand, canonical_slug)
+    VALUES (?, ?, ?, 'Pokemon', ?)
+  `);
+
+  for (const set of LAST_10_RELEASED_SETS) {
+    insertRelease.run(
+      set.name,
+      set.name,
+      set.release_date,
+      "Auto-seeded released set catalog",
+      "https://www.pokemon.com/us/pokemon-tcg"
+    );
+    for (const type of PRODUCT_TYPE_TERMS) {
+      const title = `${set.name} ${type}`;
+      insertProduct.run(title, set.name, type, slugify(title));
+    }
+  }
 }
 
 function planFromPriceId(priceId) {
@@ -1392,6 +1433,7 @@ async function runAutomatedScan(userId = null, options = {}) {
 }
 
 ensureOwnerSeeded();
+ensureReleasedSetCatalogSeeded();
 
 app.post("/stripe/webhook", express.raw({ type: "application/json" }), (req, res) => {
   if (!stripe || !process.env.STRIPE_WEBHOOK_SECRET) {
@@ -1729,6 +1771,19 @@ app.get("/dashboard", requireAuth, (req, res) => {
         </form>
       </div>
       <div class="card">
+        <h2>Catalog search seeding</h2>
+        <p class="muted">Includes the last 10 released sets with ETBs, booster bundles, sleeved packs, booster boxes, blisters, tins, and collection boxes.</p>
+        <ul>
+          ${LAST_10_RELEASED_SETS.slice(0, 10).map((set) => `<li>${escapeHtml(set.release_date)} — ${escapeHtml(set.name)}</li>`).join("")}
+        </ul>
+        <form method="post" action="/catalog/import-target-searches" style="margin-top:12px;">
+          <button>Import Target search targets for last 10 sets</button>
+        </form>
+        <form method="post" action="/catalog/import-sample-target-offers" style="margin-top:10px;">
+          <button>Import sample Target product links</button>
+        </form>
+      </div>
+      <div class="card">
         <h2>Add alert target</h2>
         <form method="post" action="/alerts">
           <label>Name</label><input name="name" required placeholder="Journey Together ETB" />
@@ -1949,6 +2004,46 @@ app.post("/settings/alert-preferences", requireAuth, (req, res) => {
   );
 
   return res.redirect("/dashboard?flash=success&message=Alert%20preferences%20saved");
+});
+
+app.post("/catalog/import-target-searches", requireAuth, (req, res) => {
+  const user = ownerOverride(getUserById(req.auth.sub));
+  const existing = new Set(
+    db.prepare("SELECT name FROM alert_targets WHERE user_id = ? AND lower(retailer) LIKE '%target%'").all(user.id).map((row) => row.name)
+  );
+  const queries = buildCatalogQueries();
+  const insert = db.prepare(`
+    INSERT INTO alert_targets (user_id, name, retailer, product_url, channel_type, channel_value, active)
+    VALUES (?, ?, 'Target', ?, 'discord', ?, 1)
+  `);
+
+  const defaultWebhook = String(user.discord_webhook || "").trim();
+  let added = 0;
+  for (const item of queries) {
+    if (existing.has(item.query)) continue;
+    const url = retailerSearchUrl("target", item.query);
+    if (!url) continue;
+    insert.run(user.id, item.query, url, defaultWebhook || "");
+    added += 1;
+  }
+  return res.redirect(`/dashboard?flash=success&message=Imported%20${added}%20Target%20search%20targets`);
+});
+
+app.post("/catalog/import-sample-target-offers", requireAuth, (req, res) => {
+  try {
+    let added = 0;
+    for (const url of SAMPLE_TARGET_URLS) {
+      try {
+        ensureProductAndOffer(url, "Target Pokemon TCG Listing", null, STATES.LISTED, "target");
+        added += 1;
+      } catch {
+        // no-op for duplicates
+      }
+    }
+    return res.redirect(`/dashboard?flash=success&message=Imported%20${added}%20sample%20Target%20offers`);
+  } catch (err) {
+    return res.redirect("/dashboard?flash=error&message=Sample%20Target%20offer%20import%20failed");
+  }
 });
 
 app.post("/alerts/target/scan-now", requireAuth, async (req, res) => {

@@ -74,3 +74,8 @@ And price-drop events when threshold conditions are met.
 - `GET /api/feeds/normalized-offers` — deduped normalized offer view.
 - `GET /api/feeds/market-sightings` — marketplace/secondary-market visibility separated from first-party.
 - `GET /api/admin/pipeline-traces` — operator drill-down for source hit -> parse -> normalize -> dedupe -> state -> decision.
+
+## Catalog seeding (current implementation)
+
+- The app seeds the last 10 released Scarlet & Violet-era sets into the release/calendar lane.
+- Search-target generation includes product forms such as ETB, Booster Bundle, Sleeved Booster Pack, Booster Box, blisters, tins, and collection boxes.
