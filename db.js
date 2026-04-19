@@ -182,6 +182,12 @@ function createDb(dbPath = "app.db") {
   if (!hasColumn("users", "discord_webhook")) {
     db.exec("ALTER TABLE users ADD COLUMN discord_webhook TEXT");
   }
+  if (!hasColumn("users", "email_address")) {
+    db.exec("ALTER TABLE users ADD COLUMN email_address TEXT");
+  }
+  if (!hasColumn("users", "phone_number")) {
+    db.exec("ALTER TABLE users ADD COLUMN phone_number TEXT");
+  }
   if (!hasColumn("alert_targets", "last_scan_status")) {
     db.exec("ALTER TABLE alert_targets ADD COLUMN last_scan_status TEXT NOT NULL DEFAULT 'unknown'");
   }

@@ -24,6 +24,12 @@ const { parseWalmartSignal } = require("./parsers/walmart.adapter");
 const { parseGameStopSignal } = require("./parsers/gamestop.adapter");
 const { twoPassConfirm, shouldEmitByConfidence, isWithinCooldown } = require("./monitors/noise-gate");
 const { persistRawSnapshot } = require("./services/snapshot-store");
+const {
+  classifyEventSeverity,
+  shouldDeliverBySeverity,
+  shouldDeliverByPriceCeiling
+} = require("./services/alert-policy");
+const { sendEmailAlert, sendSmsAlert } = require("./services/multi-channel-notifier");
 
 const app = express();
 const db = createDb(path.join(__dirname, "..", "app.db"));
@@ -500,8 +506,16 @@ async function sendPokemonCenterDiscordEvent(userId, event) {
   const user = db.prepare("SELECT * FROM users WHERE id = ?").get(userId);
   const prefs = getUserAlertPreferences(userId);
   const webhook = String(user?.discord_webhook || "").trim();
+  const severity = classifyEventSeverity(event);
+  if (!shouldDeliverBySeverity(prefs.severity, severity)) {
+    return;
+  }
+  if (!shouldDeliverByPriceCeiling(prefs.price_ceiling, event.newPrice)) {
+    return;
+  }
 
   const content = [
+    `Severity: ${severity.toUpperCase()}`,
     `Pokémon Center ${event.newState}: ${event.productName}`,
     `URL: ${event.productUrl}`,
     `Price: ${event.newPrice == null ? "N/A" : `$${event.newPrice.toFixed(2)}`}`,
@@ -514,13 +528,30 @@ async function sendPokemonCenterDiscordEvent(userId, event) {
   }
 
   if (prefs.email_enabled) {
-    // Phase 4 placeholder; replace with provider integration when keys are configured.
-    logNotification(userId, "email", content, "queued");
+    try {
+      const result = await sendEmailAlert({
+        to: String(user?.email_address || user?.email || "").trim(),
+        subject: `Pokemon alert: ${event.productName} (${event.newState})`,
+        message: content,
+        userId
+      });
+      logNotification(userId, "email", content, result.status);
+    } catch (err) {
+      logNotification(userId, "email", `${content}\nERROR:${err.message}`, "failed");
+    }
   }
 
   if (prefs.sms_enabled) {
-    // Phase 4 placeholder; replace with provider integration when keys are configured.
-    logNotification(userId, "sms", content, "queued");
+    try {
+      const result = await sendSmsAlert({
+        to: String(user?.phone_number || "").trim(),
+        message: content,
+        userId
+      });
+      logNotification(userId, "sms", content, result.status);
+    } catch (err) {
+      logNotification(userId, "sms", `${content}\nERROR:${err.message}`, "failed");
+    }
   }
 }
 
@@ -1395,6 +1426,10 @@ app.get("/dashboard", requireAuth, (req, res) => {
         <form method="post" action="/settings/discord-webhook">
           <label>Default Discord webhook</label>
           <input name="discord_webhook" type="url" placeholder="https://discord.com/api/webhooks/..." value="${escapeHtml(user.discord_webhook || "")}" />
+          <label style="margin-top:12px; display:block;">Alert email (optional)</label>
+          <input name="email_address" type="email" placeholder="you@example.com" value="${escapeHtml(user.email_address || user.email || "")}" />
+          <label style="margin-top:12px; display:block;">Alert phone (optional)</label>
+          <input name="phone_number" placeholder="+15555550123" value="${escapeHtml(user.phone_number || "")}" />
           <div style="margin-top:16px;"><button>Save default webhook</button></div>
         </form>
         <form method="post" action="/alerts/target/scan-now" style="margin-top:12px;">
@@ -1609,10 +1644,13 @@ app.post("/alerts/:id/find-link", requireAuth, (req, res) => {
 app.post("/settings/discord-webhook", requireAuth, (req, res) => {
   const user = ownerOverride(getUserById(req.auth.sub));
   const webhook = String(req.body.discord_webhook || "").trim();
+  const emailAddress = String(req.body.email_address || "").trim().toLowerCase();
+  const phoneNumber = String(req.body.phone_number || "").trim();
   if (webhook && !isValidDiscordWebhookUrl(webhook)) {
     return res.redirect("/dashboard?flash=error&message=Please%20enter%20a%20valid%20Discord%20webhook%20URL");
   }
-  db.prepare("UPDATE users SET discord_webhook = ? WHERE id = ?").run(webhook || null, user.id);
+  db.prepare("UPDATE users SET discord_webhook = ?, email_address = ?, phone_number = ? WHERE id = ?")
+    .run(webhook || null, emailAddress || null, phoneNumber || null, user.id);
   res.redirect("/dashboard?flash=success&message=Default%20Discord%20webhook%20saved");
 });
 
@@ -1789,6 +1827,34 @@ app.get("/retail/feed", requireAuth, (_req, res) => {
     LIMIT 100
   `).all();
   return res.json({ rows });
+});
+
+app.get("/api/monitor/snapshots", requireAuth, (req, res) => {
+  const limitRaw = Number(req.query.limit || 100);
+  const limit = Math.max(1, Math.min(Number.isFinite(limitRaw) ? limitRaw : 100, 500));
+  const rows = db.prepare(`
+    SELECT ms.id, ms.retailer_key, ms.product_offer_id, ms.product_url, ms.availability_state,
+           ms.confidence_score, ms.detected_at, po.current_state, p.canonical_name
+    FROM monitor_snapshots ms
+    LEFT JOIN product_offers po ON po.id = ms.product_offer_id
+    LEFT JOIN products p ON p.id = po.product_id
+    ORDER BY ms.detected_at DESC
+    LIMIT ?
+  `).all(limit);
+  return res.json({ rows, count: rows.length, generated_at: new Date().toISOString() });
+});
+
+app.get("/api/notifications/logs", requireAuth, (req, res) => {
+  const limitRaw = Number(req.query.limit || 100);
+  const limit = Math.max(1, Math.min(Number.isFinite(limitRaw) ? limitRaw : 100, 500));
+  const rows = db.prepare(`
+    SELECT nl.id, nl.user_id, u.email, nl.channel, nl.status, nl.message, nl.created_at
+    FROM notification_logs nl
+    LEFT JOIN users u ON u.id = nl.user_id
+    ORDER BY nl.created_at DESC
+    LIMIT ?
+  `).all(limit);
+  return res.json({ rows, count: rows.length, generated_at: new Date().toISOString() });
 });
 
 app.post("/market/snapshot", requireAuth, (req, res) => {

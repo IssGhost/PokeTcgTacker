@@ -6,8 +6,13 @@ const { tasks } = require('../app');
 getEnv();
 
 async function runNotificationPass() {
-  await tasks.sendAutomatedTargetUpdates();
-  await tasks.sendPokemonCenterDigest();
+  const mode = String(process.env.NOTIFICATION_WORKER_MODE || 'all').toLowerCase();
+  if (mode === 'all' || mode === 'target') {
+    await tasks.sendAutomatedTargetUpdates();
+  }
+  if (mode === 'all' || mode === 'pokemoncenter') {
+    await tasks.sendPokemonCenterDigest();
+  }
 }
 
 if (require.main === module) {
