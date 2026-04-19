@@ -31,6 +31,13 @@ const {
 } = require("./services/alert-policy");
 const { sendEmailAlert, sendSmsAlert } = require("./services/multi-channel-notifier");
 const { queueNotification, processQueuedNotifications } = require("./services/notification-dispatcher");
+const { getAllSources, upsertSource } = require("./services/source-registry");
+const {
+  recordRawSighting,
+  upsertNormalizedOffer,
+  recordSuppression,
+  recordPipelineTrace
+} = require("./services/ingestion-visibility");
 
 const app = express();
 const db = createDb(path.join(__dirname, "..", "app.db"));
@@ -48,6 +55,8 @@ const POKEMON_CENTER_MONITOR_INTERVAL_MS = Math.max(Number(process.env.POKEMON_C
 const POKEMON_CENTER_DIGEST_INTERVAL_MS = Math.max(Number(process.env.POKEMON_CENTER_DIGEST_INTERVAL_MS || 21600000), 300000);
 const MAJOR_RETAIL_MONITOR_ENABLED = String(process.env.MAJOR_RETAIL_MONITOR_ENABLED || "true").toLowerCase() !== "false";
 const MAJOR_RETAIL_MONITOR_INTERVAL_MS = Math.max(Number(process.env.MAJOR_RETAIL_MONITOR_INTERVAL_MS || 120000), 30000);
+const SOURCE_REGISTRY_MONITOR_ENABLED = String(process.env.SOURCE_REGISTRY_MONITOR_ENABLED || "true").toLowerCase() !== "false";
+const SOURCE_REGISTRY_MONITOR_INTERVAL_MS = Math.max(Number(process.env.SOURCE_REGISTRY_MONITOR_INTERVAL_MS || 120000), 30000);
 const POKEMON_CENTER_DISCOVERY_URLS = String(
   process.env.POKEMON_CENTER_DISCOVERY_URLS
     || "https://www.pokemoncenter.com/sitemap.xml,https://www.pokemoncenter.com/category/trading-card-game,https://www.pokemoncenter.com/category/new-releases,https://www.pokemoncenter.com/category/preorder,https://www.pokemoncenter.com/category/back-in-stock"
@@ -598,6 +607,45 @@ async function monitorPokemonCenterProduct(productUrl) {
   );
   const oldState = offer.current_state || STATES.UNKNOWN;
   const oldPrice = typeof offer.last_seen_price === "number" ? offer.last_seen_price : null;
+  const sourceKey = "pokemoncenter";
+  const sourceType = "official_retailer";
+
+  recordRawSighting(db, {
+    source_key: sourceKey,
+    source_type: sourceType,
+    scrape_url: productUrl,
+    product_url: productUrl,
+    title: parsedSignal.title || title,
+    seller_name: "Pokemon Center",
+    seller_type: "first_party",
+    price: parsedSignal.price,
+    currency: parsedSignal.currency || "USD",
+    availability_state: parsedSignal.availability_state,
+    confidence_score: parsedSignal.confidence_score,
+    parser_version: "pokemoncenter.adapter:v1",
+    raw_signal: parsedSignal.raw_signal
+  });
+
+  upsertNormalizedOffer(db, {
+    source_key: sourceKey,
+    source_type: sourceType,
+    product_offer_id: offer.id,
+    product_id: product.id,
+    product_url: productUrl,
+    external_id: parsedSignal.external_id,
+    title: parsedSignal.title || title,
+    variant: parsedSignal.variant,
+    image_url: parsedSignal.image_url,
+    seller_name: "Pokemon Center",
+    seller_type: "first_party",
+    price: parsedSignal.price,
+    shipping_price: 0,
+    total_price: parsedSignal.price,
+    currency: parsedSignal.currency || "USD",
+    availability_state: parsedSignal.availability_state,
+    confidence_score: parsedSignal.confidence_score,
+    parser_version: "pokemoncenter.adapter:v1"
+  });
 
   persistRawSnapshot(db, {
     retailer_key: "pokemoncenter",
@@ -646,6 +694,12 @@ async function monitorPokemonCenterProduct(productUrl) {
     cooldownMs: Number(process.env.ALERT_DEDUPE_COOLDOWN_MS || 600000)
   });
 
+  const suppressionReasons = [];
+  if (!(transitioned || droppedPrice)) suppressionReasons.push("suppressed_by_transition_rules");
+  if (!passesConfidence) suppressionReasons.push("suppressed_by_confidence");
+  if (withinCooldown) suppressionReasons.push("suppressed_by_cooldown");
+  if (confirmResult.retracted) suppressionReasons.push("suppressed_by_unverified_second_pass");
+
   if ((transitioned || droppedPrice) && passesConfidence && !withinCooldown) {
     db.prepare(`
       INSERT INTO events (product_offer_id, event_type, old_state, new_state, old_price, new_price, raw_snapshot_hash)
@@ -661,12 +715,43 @@ async function monitorPokemonCenterProduct(productUrl) {
     );
   }
 
+  if (suppressionReasons.length > 0) {
+    suppressionReasons.forEach((reason) => {
+      recordSuppression(db, {
+        source_key: sourceKey,
+        product_offer_id: offer.id,
+        product_url: productUrl,
+        reason,
+        details: { oldState, state, oldPrice, price, confidence: signalToUse.confidence_score }
+      });
+    });
+  }
+
   if (confirmResult.retracted) {
     db.prepare(`
       INSERT INTO events (product_offer_id, event_type, old_state, new_state, old_price, new_price, raw_snapshot_hash)
       VALUES (?, 'RETRACTED_TENTATIVE', ?, ?, ?, ?, ?)
     `).run(offer.id, oldState, state, oldPrice, price, `${snapshotHash}:retracted`);
   }
+
+  recordPipelineTrace(db, {
+    source_key: sourceKey,
+    product_url: productUrl,
+    source_hit: { productUrl, nowIso },
+    parse_result: parsedSignal,
+    normalization_result: {
+      state,
+      price,
+      confidence: signalToUse.confidence_score
+    },
+    dedupe_result: { withinCooldown },
+    state_result: { oldState, newState: state, transitioned, droppedPrice },
+    alert_decision: {
+      emitted: (transitioned || droppedPrice) && passesConfidence && !withinCooldown,
+      suppressionReasons
+    },
+    notification_result: { queued: false }
+  });
 
   return {
     product,
@@ -897,6 +982,45 @@ async function monitorMajorRetailOffer(offerRow) {
   const price = signalToUse.price;
   const oldState = offerRow.current_state || STATES.UNKNOWN;
   const oldPrice = typeof offerRow.last_seen_price === "number" ? offerRow.last_seen_price : null;
+  const marketplaceDetected = /sold and shipped by|marketplace seller|third-party seller|other sellers/i.test(String(html || ""));
+  const sourceType = marketplaceDetected ? "marketplace" : "official_retailer";
+
+  recordRawSighting(db, {
+    source_key: offerRow.adapter_key,
+    source_type: sourceType,
+    scrape_url: offerRow.product_url,
+    product_url: offerRow.product_url,
+    title,
+    seller_name: marketplaceDetected ? "Marketplace Seller" : offerRow.adapter_key,
+    seller_type: marketplaceDetected ? "third_party" : "first_party",
+    price,
+    currency: signalToUse.currency || "USD",
+    availability_state: state,
+    confidence_score: signalToUse.confidence_score,
+    parser_version: `${offerRow.adapter_key}.adapter:v1`,
+    raw_signal: signalToUse.raw_signal
+  });
+
+  upsertNormalizedOffer(db, {
+    source_key: offerRow.adapter_key,
+    source_type: sourceType,
+    product_offer_id: offerRow.id,
+    product_id: offerRow.product_id,
+    product_url: offerRow.product_url,
+    external_id: signalToUse.external_id || offerRow.retailer_sku || null,
+    title,
+    variant: signalToUse.variant,
+    image_url: signalToUse.image_url,
+    seller_name: marketplaceDetected ? "Marketplace Seller" : offerRow.adapter_key,
+    seller_type: marketplaceDetected ? "third_party" : "first_party",
+    price,
+    shipping_price: null,
+    total_price: price,
+    currency: signalToUse.currency || "USD",
+    availability_state: state,
+    confidence_score: signalToUse.confidence_score,
+    parser_version: `${offerRow.adapter_key}.adapter:v1`
+  });
 
   persistRawSnapshot(db, {
     retailer_key: offerRow.adapter_key,
@@ -926,6 +1050,12 @@ async function monitorMajorRetailOffer(offerRow) {
     newState: state,
     cooldownMs: Number(process.env.ALERT_DEDUPE_COOLDOWN_MS || 600000)
   });
+  const suppressionReasons = [];
+  if (!(transitioned || droppedPrice)) suppressionReasons.push("suppressed_by_transition_rules");
+  if (!passesConfidence) suppressionReasons.push("suppressed_by_confidence");
+  if (withinCooldown) suppressionReasons.push("suppressed_by_cooldown");
+  if (confirmResult.retracted) suppressionReasons.push("suppressed_by_unverified_second_pass");
+
   if ((transitioned || droppedPrice) && passesConfidence && !withinCooldown) {
     db.prepare(`
       INSERT INTO events (product_offer_id, event_type, old_state, new_state, old_price, new_price, raw_snapshot_hash)
@@ -941,12 +1071,39 @@ async function monitorMajorRetailOffer(offerRow) {
     );
   }
 
+  if (suppressionReasons.length > 0) {
+    suppressionReasons.forEach((reason) => {
+      recordSuppression(db, {
+        source_key: offerRow.adapter_key,
+        product_offer_id: offerRow.id,
+        product_url: offerRow.product_url,
+        reason,
+        details: { oldState, state, oldPrice, price, confidence: signalToUse.confidence_score }
+      });
+    });
+  }
+
   if (confirmResult.retracted) {
     db.prepare(`
       INSERT INTO events (product_offer_id, event_type, old_state, new_state, old_price, new_price, raw_snapshot_hash)
       VALUES (?, 'RETRACTED_TENTATIVE', ?, ?, ?, ?, ?)
     `).run(offerRow.id, oldState, state, oldPrice, price, `${offerRow.adapter_key}:${Date.now()}:retracted`);
   }
+
+  recordPipelineTrace(db, {
+    source_key: offerRow.adapter_key,
+    product_url: offerRow.product_url,
+    source_hit: { productUrl: offerRow.product_url, nowIso },
+    parse_result: signal,
+    normalization_result: { sourceType, state, price, confidence: signalToUse.confidence_score },
+    dedupe_result: { withinCooldown },
+    state_result: { oldState, newState: state, transitioned, droppedPrice },
+    alert_decision: {
+      emitted: (transitioned || droppedPrice) && passesConfidence && !withinCooldown,
+      suppressionReasons
+    },
+    notification_result: { queued: false }
+  });
 
   return { transitioned, droppedPrice, state, title, price, oldState };
 }
@@ -994,6 +1151,50 @@ async function runMajorRetailMonitorCycle() {
     `).run(new Date().toISOString(), requestsMade, errorsCount + 1, runInsert.lastInsertRowid);
     throw err;
   }
+}
+
+async function runSourceRegistryCycle() {
+  const sources = getAllSources(db).filter((s) => s.enabled);
+  const jobs = sources.map((source) => (async () => {
+    const start = Date.now();
+    try {
+      if (source.source_key === "pokemoncenter") {
+        await runPokemonCenterMonitorCycle();
+      } else if (["bestbuy", "target", "walmart", "gamestop"].includes(source.source_key)) {
+        await runMajorRetailMonitorCycle();
+      } else if (source.source_type === "secondary_market") {
+        // Market lane in this build is visibility-focused and derived from market snapshots.
+        const latest = db.prepare(`
+          SELECT product_name, source_name, price, url, captured_at
+          FROM market_snapshots
+          ORDER BY captured_at DESC
+          LIMIT 20
+        `).all();
+        latest.forEach((row) => {
+          recordRawSighting(db, {
+            source_key: source.source_key,
+            source_type: "secondary_market",
+            scrape_url: row.url,
+            product_url: row.url,
+            title: row.product_name,
+            seller_name: row.source_name,
+            seller_type: "secondary_market",
+            price: row.price,
+            currency: "USD",
+            availability_state: "LISTED",
+            confidence_score: 0.6,
+            parser_version: "market.snapshot:v1",
+            raw_signal: JSON.stringify(row)
+          });
+        });
+      }
+      return { source_key: source.source_key, ok: true, duration_ms: Date.now() - start };
+    } catch (err) {
+      return { source_key: source.source_key, ok: false, duration_ms: Date.now() - start, error: err.message };
+    }
+  })());
+
+  return Promise.all(jobs);
 }
 
 function formatTimeAgo(date) {
@@ -1397,6 +1598,29 @@ app.get("/dashboard", requireAuth, (req, res) => {
     ORDER BY created_at DESC
     LIMIT 6
   `).all(user.id);
+  const ingestionCounts = db.prepare(`
+    SELECT
+      (SELECT COUNT(*) FROM raw_sightings WHERE detected_at >= datetime('now', 'start of day')) AS raw_sightings_today,
+      (SELECT COUNT(*) FROM normalized_offers WHERE updated_at >= datetime('now', 'start of day')) AS normalized_offers_today,
+      (SELECT COUNT(*) FROM events WHERE created_at >= datetime('now', 'start of day')) AS alertable_events_today,
+      (SELECT COUNT(*) FROM suppression_events WHERE created_at >= datetime('now', 'start of day')) AS suppressed_events_today,
+      (SELECT COUNT(*) FROM raw_sightings WHERE source_type IN ('marketplace', 'secondary_market') AND detected_at >= datetime('now', 'start of day')) AS marketplace_offers_today,
+      (SELECT COALESCE(SUM(errors_count), 0) FROM monitor_runs WHERE started_at >= datetime('now', 'start of day')) AS monitor_errors_today
+  `).get();
+  const sourceHealthRows = db.prepare(`
+    SELECT sr.display_name, sr.source_key, sr.source_type, sr.enabled,
+           COALESCE(mr.status, 'unknown') AS status,
+           mr.started_at, mr.finished_at, COALESCE(mr.requests_made, 0) AS requests_made, COALESCE(mr.errors_count, 0) AS errors_count
+    FROM source_registry sr
+    LEFT JOIN monitor_runs mr ON mr.id = (
+      SELECT id FROM monitor_runs m2
+      WHERE m2.adapter_key = sr.source_key OR (sr.source_key IN ('bestbuy','target','walmart','gamestop') AND m2.adapter_key = 'major-retail')
+      ORDER BY started_at DESC
+      LIMIT 1
+    )
+    ORDER BY sr.source_type ASC, sr.source_key ASC
+    LIMIT 12
+  `).all();
   const remaining = Math.max(user.alerts_quota - targets.length, 0);
   const flash = String(req.query.flash || "").trim();
   const message = String(req.query.message || "").trim();
@@ -1431,6 +1655,14 @@ app.get("/dashboard", requireAuth, (req, res) => {
 
   const body = `
     ${flashHtml}
+    <div class="grid">
+      <div class="card"><h3>Raw sightings today</h3><p>${ingestionCounts.raw_sightings_today || 0}</p></div>
+      <div class="card"><h3>Normalized offers today</h3><p>${ingestionCounts.normalized_offers_today || 0}</p></div>
+      <div class="card"><h3>Alertable events today</h3><p>${ingestionCounts.alertable_events_today || 0}</p></div>
+      <div class="card"><h3>Suppressed events today</h3><p>${ingestionCounts.suppressed_events_today || 0}</p></div>
+      <div class="card"><h3>Marketplace offers today</h3><p>${ingestionCounts.marketplace_offers_today || 0}</p></div>
+      <div class="card"><h3>Monitor errors today</h3><p>${ingestionCounts.monitor_errors_today || 0}</p></div>
+    </div>
     <div class="grid">
       <div class="card">
         <h2>Account</h2>
@@ -1571,6 +1803,17 @@ app.get("/dashboard", requireAuth, (req, res) => {
             : "<li class=\"muted\">No monitor runs yet.</li>"}
         </ul>
         <a href="/health/dashboard"><button>Open health dashboard</button></a>
+      </div>
+      <div class="card">
+        <h2>Source health</h2>
+        <ul>
+          ${sourceHealthRows.length
+            ? sourceHealthRows.map((row) => `<li>${escapeHtml(row.display_name)} (${escapeHtml(row.source_type)}) — ${escapeHtml(row.status)} — req:${row.requests_made} err:${row.errors_count}</li>`).join("")
+            : "<li class=\"muted\">No source health rows yet.</li>"}
+        </ul>
+        <form method="post" action="/sources/run" style="margin-top:8px;">
+          <button>Run all enabled sources now</button>
+        </form>
       </div>
       <div class="card">
         <h2>Market watch (Phase 4)</h2>
@@ -1848,6 +2091,115 @@ app.get("/retail/feed", requireAuth, (_req, res) => {
     LIMIT 100
   `).all();
   return res.json({ rows });
+});
+
+app.get("/api/feeds/raw-sightings", requireAuth, (req, res) => {
+  const limitRaw = Number(req.query.limit || 200);
+  const limit = Math.max(1, Math.min(Number.isFinite(limitRaw) ? limitRaw : 200, 1000));
+  const sourceType = String(req.query.source_type || "").trim();
+  const rows = sourceType
+    ? db.prepare(`
+        SELECT *
+        FROM raw_sightings
+        WHERE source_type = ?
+        ORDER BY detected_at DESC
+        LIMIT ?
+      `).all(sourceType, limit)
+    : db.prepare(`
+        SELECT *
+        FROM raw_sightings
+        ORDER BY detected_at DESC
+        LIMIT ?
+      `).all(limit);
+  return res.json({ rows, count: rows.length, generated_at: new Date().toISOString() });
+});
+
+app.get("/api/feeds/normalized-offers", requireAuth, (req, res) => {
+  const limitRaw = Number(req.query.limit || 200);
+  const limit = Math.max(1, Math.min(Number.isFinite(limitRaw) ? limitRaw : 200, 1000));
+  const rows = db.prepare(`
+    SELECT no.*, p.canonical_name
+    FROM normalized_offers no
+    LEFT JOIN products p ON p.id = no.product_id
+    ORDER BY no.updated_at DESC
+    LIMIT ?
+  `).all(limit);
+  return res.json({ rows, count: rows.length, generated_at: new Date().toISOString() });
+});
+
+app.get("/api/feeds/market-sightings", requireAuth, (req, res) => {
+  const limitRaw = Number(req.query.limit || 200);
+  const limit = Math.max(1, Math.min(Number.isFinite(limitRaw) ? limitRaw : 200, 1000));
+  const rows = db.prepare(`
+    SELECT *
+    FROM raw_sightings
+    WHERE source_type IN ('marketplace', 'secondary_market')
+    ORDER BY detected_at DESC
+    LIMIT ?
+  `).all(limit);
+  return res.json({ rows, count: rows.length, generated_at: new Date().toISOString() });
+});
+
+app.get("/api/admin/pipeline-traces", requireAuth, (req, res) => {
+  const user = ownerOverride(getUserById(req.auth.sub));
+  if (user.role !== "owner") {
+    return res.status(403).json({ error: "forbidden" });
+  }
+  const rows = db.prepare(`
+    SELECT *
+    FROM pipeline_traces
+    ORDER BY created_at DESC
+    LIMIT 200
+  `).all();
+  return res.json({ rows, count: rows.length, generated_at: new Date().toISOString() });
+});
+
+app.get("/api/sources/status", requireAuth, (_req, res) => {
+  const rows = db.prepare(`
+    SELECT sr.source_key, sr.source_type, sr.display_name, sr.enabled, sr.polling_interval_ms, sr.concurrency_limit,
+           mr.status AS last_status, mr.started_at AS last_started_at, mr.finished_at AS last_finished_at,
+           mr.requests_made, mr.errors_count
+    FROM source_registry sr
+    LEFT JOIN monitor_runs mr ON mr.id = (
+      SELECT id FROM monitor_runs m2
+      WHERE m2.adapter_key = sr.source_key OR (sr.source_key IN ('bestbuy','target','walmart','gamestop') AND m2.adapter_key = 'major-retail')
+      ORDER BY started_at DESC
+      LIMIT 1
+    )
+    ORDER BY sr.source_type, sr.source_key
+  `).all();
+  return res.json({ rows, count: rows.length, generated_at: new Date().toISOString() });
+});
+
+app.post("/api/sources/run", requireAuth, async (req, res) => {
+  try {
+    const results = await runSourceRegistryCycle();
+    return res.json({ ok: true, results, generated_at: new Date().toISOString() });
+  } catch (err) {
+    return res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.post("/sources/run", requireAuth, async (_req, res) => {
+  try {
+    await runSourceRegistryCycle();
+    return res.redirect("/dashboard?flash=success&message=Source%20registry%20run%20completed");
+  } catch (err) {
+    return res.redirect("/dashboard?flash=error&message=Source%20registry%20run%20failed");
+  }
+});
+
+app.post("/api/admin/sources/upsert", requireAuth, (req, res) => {
+  const user = ownerOverride(getUserById(req.auth.sub));
+  if (user.role !== "owner") {
+    return res.status(403).json({ error: "forbidden" });
+  }
+  try {
+    upsertSource(db, req.body || {});
+    return res.json({ ok: true });
+  } catch (err) {
+    return res.status(400).json({ ok: false, error: err.message });
+  }
 });
 
 app.get("/api/monitor/snapshots", requireAuth, (req, res) => {
@@ -2144,6 +2496,16 @@ function startSchedulers() {
       }
     }, MAJOR_RETAIL_MONITOR_INTERVAL_MS);
   }
+
+  if (SOURCE_REGISTRY_MONITOR_ENABLED) {
+    setInterval(async () => {
+      try {
+        await runSourceRegistryCycle();
+      } catch (err) {
+        console.error("Source registry cycle failed:", err);
+      }
+    }, SOURCE_REGISTRY_MONITOR_INTERVAL_MS);
+  }
 }
 
 function logStartupConfig() {
@@ -2165,6 +2527,11 @@ function logStartupConfig() {
   } else {
     console.log("Major retail monitor disabled");
   }
+  if (SOURCE_REGISTRY_MONITOR_ENABLED) {
+    console.log(`Source registry monitor enabled every ${SOURCE_REGISTRY_MONITOR_INTERVAL_MS}ms`);
+  } else {
+    console.log("Source registry monitor disabled");
+  }
 }
 
 module.exports = {
@@ -2180,7 +2547,9 @@ module.exports = {
     POKEMON_CENTER_MONITOR_INTERVAL_MS,
     POKEMON_CENTER_DIGEST_INTERVAL_MS,
     MAJOR_RETAIL_MONITOR_ENABLED,
-    MAJOR_RETAIL_MONITOR_INTERVAL_MS
+    MAJOR_RETAIL_MONITOR_INTERVAL_MS,
+    SOURCE_REGISTRY_MONITOR_ENABLED,
+    SOURCE_REGISTRY_MONITOR_INTERVAL_MS
   },
   startSchedulers,
   logStartupConfig,
@@ -2189,6 +2558,7 @@ module.exports = {
     runPokemonCenterDiscovery,
     runPokemonCenterMonitorCycle,
     runMajorRetailMonitorCycle,
+    runSourceRegistryCycle,
     sendPokemonCenterDigest,
     sendTarget24hUpdate,
     sendAutomatedTargetUpdates

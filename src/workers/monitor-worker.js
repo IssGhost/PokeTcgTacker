@@ -17,6 +17,9 @@ async function runMonitorPass() {
   if (mode === 'all' || mode === 'target-scan') {
     await tasks.runAutomatedScan(null, { targetOnly: true });
   }
+  if (mode === 'all' || mode === 'source-registry') {
+    await tasks.runSourceRegistryCycle();
+  }
 }
 
 if (require.main === module) {

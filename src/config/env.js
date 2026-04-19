@@ -14,7 +14,9 @@ function getEnv() {
     APP_URL: process.env.APP_URL || '',
     MONITOR_WORKER_MODE: process.env.MONITOR_WORKER_MODE || 'all',
     NOTIFICATION_WORKER_MODE: process.env.NOTIFICATION_WORKER_MODE || 'all',
-    NOTIFICATION_QUEUE_BATCH_SIZE: Number(process.env.NOTIFICATION_QUEUE_BATCH_SIZE || 50)
+    NOTIFICATION_QUEUE_BATCH_SIZE: Number(process.env.NOTIFICATION_QUEUE_BATCH_SIZE || 50),
+    SOURCE_REGISTRY_MONITOR_ENABLED: String(process.env.SOURCE_REGISTRY_MONITOR_ENABLED || 'true').toLowerCase() !== 'false',
+    SOURCE_REGISTRY_MONITOR_INTERVAL_MS: Number(process.env.SOURCE_REGISTRY_MONITOR_INTERVAL_MS || 120000)
   };
 
   if (!Number.isFinite(env.PORT) || env.PORT <= 0) {
@@ -22,6 +24,9 @@ function getEnv() {
   }
   if (!Number.isFinite(env.NOTIFICATION_QUEUE_BATCH_SIZE) || env.NOTIFICATION_QUEUE_BATCH_SIZE <= 0) {
     throw new Error('NOTIFICATION_QUEUE_BATCH_SIZE must be a positive number');
+  }
+  if (!Number.isFinite(env.SOURCE_REGISTRY_MONITOR_INTERVAL_MS) || env.SOURCE_REGISTRY_MONITOR_INTERVAL_MS <= 0) {
+    throw new Error('SOURCE_REGISTRY_MONITOR_INTERVAL_MS must be a positive number');
   }
 
   return env;

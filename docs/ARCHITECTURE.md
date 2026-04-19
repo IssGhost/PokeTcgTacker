@@ -22,6 +22,8 @@
 - **Alert Service**
 - **Digest Service** (6-hour summary)
 - **Admin/API**
+- **Source Registry Service**
+- **Ingestion Visibility Service** (raw sightings, normalized offers, suppression reasons, pipeline traces)
 
 ## Normalized state machine
 
@@ -65,3 +67,10 @@ And price-drop events when threshold conditions are met.
 - DB: Railway Postgres/Neon/Supabase
 - Redis: Upstash/Railway Redis
 - Digest: Railway Cron / scheduled workflow
+
+## Visibility-first feeds (current implementation)
+
+- `GET /api/feeds/raw-sightings` — every source hit, including low-confidence/suppressed cases.
+- `GET /api/feeds/normalized-offers` — deduped normalized offer view.
+- `GET /api/feeds/market-sightings` — marketplace/secondary-market visibility separated from first-party.
+- `GET /api/admin/pipeline-traces` — operator drill-down for source hit -> parse -> normalize -> dedupe -> state -> decision.

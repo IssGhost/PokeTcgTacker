@@ -177,6 +177,94 @@ function createDb(dbPath = "app.db") {
       detected_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
       FOREIGN KEY(product_offer_id) REFERENCES product_offers(id)
     );
+
+    CREATE TABLE IF NOT EXISTS source_registry (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      source_key TEXT UNIQUE NOT NULL,
+      source_type TEXT NOT NULL,
+      display_name TEXT NOT NULL,
+      enabled INTEGER NOT NULL DEFAULT 1,
+      polling_interval_ms INTEGER NOT NULL DEFAULT 120000,
+      concurrency_limit INTEGER NOT NULL DEFAULT 2,
+      request_strategy TEXT,
+      normalization_strategy TEXT,
+      confidence_policy TEXT,
+      suppression_policy TEXT,
+      product_matcher TEXT,
+      offer_ranking_rules TEXT,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS raw_sightings (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      source_key TEXT NOT NULL,
+      source_type TEXT NOT NULL,
+      scrape_url TEXT,
+      product_url TEXT,
+      title TEXT,
+      seller_name TEXT,
+      seller_type TEXT,
+      price REAL,
+      currency TEXT NOT NULL DEFAULT 'USD',
+      availability_state TEXT NOT NULL DEFAULT 'UNKNOWN',
+      confidence_score REAL NOT NULL DEFAULT 0.5,
+      parser_version TEXT,
+      raw_signal TEXT,
+      raw_hash TEXT,
+      suppression_reason TEXT,
+      detected_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS normalized_offers (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      source_key TEXT NOT NULL,
+      source_type TEXT NOT NULL,
+      product_offer_id INTEGER,
+      product_id INTEGER,
+      product_url TEXT,
+      external_id TEXT,
+      title TEXT,
+      variant TEXT,
+      image_url TEXT,
+      seller_name TEXT,
+      seller_type TEXT,
+      price REAL,
+      shipping_price REAL,
+      total_price REAL,
+      currency TEXT NOT NULL DEFAULT 'USD',
+      availability_state TEXT NOT NULL DEFAULT 'UNKNOWN',
+      confidence_score REAL NOT NULL DEFAULT 0.5,
+      parser_version TEXT,
+      normalized_hash TEXT,
+      detected_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(source_key, product_url, seller_name)
+    );
+
+    CREATE TABLE IF NOT EXISTS suppression_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      source_key TEXT NOT NULL,
+      product_offer_id INTEGER,
+      product_url TEXT,
+      reason TEXT NOT NULL,
+      details TEXT,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS pipeline_traces (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      source_key TEXT NOT NULL,
+      product_url TEXT,
+      source_hit_json TEXT,
+      parse_result_json TEXT,
+      normalization_result_json TEXT,
+      dedupe_result_json TEXT,
+      state_result_json TEXT,
+      alert_decision_json TEXT,
+      notification_result_json TEXT,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
   `);
 
   if (!hasColumn("users", "discord_webhook")) {
@@ -207,6 +295,17 @@ function createDb(dbPath = "app.db") {
     db.exec("ALTER TABLE notification_logs ADD COLUMN next_attempt_at TEXT");
   }
 
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_monitor_snapshots_detected_at ON monitor_snapshots(detected_at);
+    CREATE INDEX IF NOT EXISTS idx_raw_sightings_detected_at ON raw_sightings(detected_at);
+    CREATE INDEX IF NOT EXISTS idx_raw_sightings_source_key ON raw_sightings(source_key);
+    CREATE INDEX IF NOT EXISTS idx_normalized_offers_detected_at ON normalized_offers(detected_at);
+    CREATE INDEX IF NOT EXISTS idx_normalized_offers_source_type ON normalized_offers(source_type);
+    CREATE INDEX IF NOT EXISTS idx_suppression_events_created_at ON suppression_events(created_at);
+    CREATE INDEX IF NOT EXISTS idx_pipeline_traces_created_at ON pipeline_traces(created_at);
+    CREATE INDEX IF NOT EXISTS idx_notification_logs_due ON notification_logs(status, next_attempt_at, created_at);
+  `);
+
   db.prepare(`
     INSERT OR IGNORE INTO retailers (name, base_url, adapter_key, enabled)
     VALUES
@@ -215,6 +314,19 @@ function createDb(dbPath = "app.db") {
       ('Target', 'https://www.target.com', 'target', 1),
       ('Walmart', 'https://www.walmart.com', 'walmart', 1),
       ('GameStop', 'https://www.gamestop.com', 'gamestop', 1)
+  `).run();
+
+  db.prepare(`
+    INSERT OR IGNORE INTO source_registry
+      (source_key, source_type, display_name, enabled, polling_interval_ms, concurrency_limit, request_strategy, normalization_strategy, confidence_policy, suppression_policy, product_matcher, offer_ranking_rules)
+    VALUES
+      ('pokemoncenter', 'official_retailer', 'Pokémon Center', 1, 60000, 2, 'html_fetch', 'pokemoncenter.adapter', 'default_high_confidence', 'default_suppression', 'slug_matcher', 'first_party_first'),
+      ('target', 'official_retailer', 'Target', 1, 120000, 2, 'html_fetch', 'target.adapter', 'default_high_confidence', 'default_suppression', 'slug_matcher', 'first_party_first'),
+      ('walmart', 'official_retailer', 'Walmart', 1, 120000, 2, 'html_fetch', 'walmart.adapter', 'default_medium_confidence', 'default_suppression', 'slug_matcher', 'first_party_first'),
+      ('bestbuy', 'official_retailer', 'Best Buy', 1, 120000, 2, 'html_fetch', 'bestbuy.adapter', 'default_high_confidence', 'default_suppression', 'sku_matcher', 'first_party_first'),
+      ('gamestop', 'official_retailer', 'GameStop', 1, 120000, 2, 'html_fetch', 'gamestop.adapter', 'default_medium_confidence', 'default_suppression', 'slug_matcher', 'first_party_first'),
+      ('tcgplayer_market', 'secondary_market', 'TCGPlayer Market Lane', 1, 300000, 1, 'manual_snapshot', 'market.snapshot', 'market_informational', 'market_suppression', 'fuzzy_matcher', 'price_then_confidence'),
+      ('ebay_market', 'secondary_market', 'eBay Market Lane', 1, 300000, 1, 'manual_snapshot', 'market.snapshot', 'market_informational', 'market_suppression', 'fuzzy_matcher', 'price_then_confidence')
   `).run();
 
   return db;
