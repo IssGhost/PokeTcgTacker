@@ -1440,7 +1440,7 @@ app.post("/alerts", requireAuth, (req, res) => {
     return res.status(400).send(renderPage("Quota reached", `<div class="card"><p class="danger">You have reached your alert quota for the ${user.subscription_tier} plan.</p><a href="/pricing"><button>Upgrade plan</button></a></div>`, user));
   }
 
-  const payload = {
+  const payload = {    
     name: String(req.body.name || "").trim(),
     retailer: String(req.body.retailer || "").trim(),
     product_url: String(req.body.product_url || "").trim(),
