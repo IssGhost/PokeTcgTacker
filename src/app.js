@@ -30,6 +30,7 @@ const {
   shouldDeliverByPriceCeiling
 } = require("./services/alert-policy");
 const { sendEmailAlert, sendSmsAlert } = require("./services/multi-channel-notifier");
+const { queueNotification, processQueuedNotifications } = require("./services/notification-dispatcher");
 
 const app = express();
 const db = createDb(path.join(__dirname, "..", "app.db"));
@@ -173,11 +174,19 @@ function getUserAlertPreferences(userId) {
   return prefs;
 }
 
-function logNotification(userId, channel, message, status = "queued") {
+function logNotification(userId, channel, message, status = "queued", meta = {}) {
   db.prepare(`
-    INSERT INTO notification_logs (user_id, channel, message, status)
-    VALUES (?, ?, ?, ?)
-  `).run(userId, channel, message, status);
+    INSERT INTO notification_logs (user_id, channel, message, status, attempts_count, last_error, next_attempt_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    userId,
+    channel,
+    message,
+    status,
+    Number(meta.attempts_count || 0),
+    meta.last_error || null,
+    meta.next_attempt_at || null
+  );
 }
 
 function currentUser(req) {
@@ -523,8 +532,12 @@ async function sendPokemonCenterDiscordEvent(userId, event) {
   ].join("\n");
 
   if (prefs.discord_enabled && isValidDiscordWebhookUrl(webhook)) {
-    await postJson(webhook, { content });
-    logNotification(userId, "discord", content, "sent");
+    try {
+      await postJson(webhook, { content });
+      logNotification(userId, "discord", content, "sent", { attempts_count: 1 });
+    } catch (err) {
+      queueNotification(db, { userId, channel: "discord", message: content, status: "queued" });
+    }
   }
 
   if (prefs.email_enabled) {
@@ -535,9 +548,13 @@ async function sendPokemonCenterDiscordEvent(userId, event) {
         message: content,
         userId
       });
-      logNotification(userId, "email", content, result.status);
+      if (result.status === "sent") {
+        logNotification(userId, "email", content, result.status, { attempts_count: 1 });
+      } else {
+        queueNotification(db, { userId, channel: "email", message: content, status: "queued" });
+      }
     } catch (err) {
-      logNotification(userId, "email", `${content}\nERROR:${err.message}`, "failed");
+      queueNotification(db, { userId, channel: "email", message: content, status: "queued" });
     }
   }
 
@@ -548,9 +565,13 @@ async function sendPokemonCenterDiscordEvent(userId, event) {
         message: content,
         userId
       });
-      logNotification(userId, "sms", content, result.status);
+      if (result.status === "sent") {
+        logNotification(userId, "sms", content, result.status, { attempts_count: 1 });
+      } else {
+        queueNotification(db, { userId, channel: "sms", message: content, status: "queued" });
+      }
     } catch (err) {
-      logNotification(userId, "sms", `${content}\nERROR:${err.message}`, "failed");
+      queueNotification(db, { userId, channel: "sms", message: content, status: "queued" });
     }
   }
 }
@@ -1844,6 +1865,21 @@ app.get("/api/monitor/snapshots", requireAuth, (req, res) => {
   return res.json({ rows, count: rows.length, generated_at: new Date().toISOString() });
 });
 
+app.get("/api/monitor/snapshots/:id", requireAuth, (req, res) => {
+  const id = Number(req.params.id);
+  const row = db.prepare(`
+    SELECT ms.*, po.current_state, p.canonical_name
+    FROM monitor_snapshots ms
+    LEFT JOIN product_offers po ON po.id = ms.product_offer_id
+    LEFT JOIN products p ON p.id = po.product_id
+    WHERE ms.id = ?
+  `).get(id);
+  if (!row) {
+    return res.status(404).json({ error: "snapshot_not_found" });
+  }
+  return res.json({ row });
+});
+
 app.get("/api/notifications/logs", requireAuth, (req, res) => {
   const limitRaw = Number(req.query.limit || 100);
   const limit = Math.max(1, Math.min(Number.isFinite(limitRaw) ? limitRaw : 100, 500));
@@ -1855,6 +1891,23 @@ app.get("/api/notifications/logs", requireAuth, (req, res) => {
     LIMIT ?
   `).all(limit);
   return res.json({ rows, count: rows.length, generated_at: new Date().toISOString() });
+});
+
+app.post("/admin/notifications/process", requireAuth, async (req, res) => {
+  const user = ownerOverride(getUserById(req.auth.sub));
+  if (user.role !== "owner") {
+    return res.status(403).json({ error: "forbidden" });
+  }
+
+  try {
+    const limitRaw = Number(req.body.limit || req.query.limit || 50);
+    const limit = Math.max(1, Math.min(Number.isFinite(limitRaw) ? limitRaw : 50, 200));
+    const result = await processQueuedNotifications(db, { limit });
+    return res.json({ ok: true, ...result });
+  } catch (err) {
+    console.error("notification queue processing failed:", err);
+    return res.status(500).json({ ok: false, error: err.message });
+  }
 });
 
 app.post("/market/snapshot", requireAuth, (req, res) => {

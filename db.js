@@ -197,6 +197,15 @@ function createDb(dbPath = "app.db") {
   if (!hasColumn("alert_targets", "last_alerted_at")) {
     db.exec("ALTER TABLE alert_targets ADD COLUMN last_alerted_at TEXT");
   }
+  if (!hasColumn("notification_logs", "attempts_count")) {
+    db.exec("ALTER TABLE notification_logs ADD COLUMN attempts_count INTEGER NOT NULL DEFAULT 0");
+  }
+  if (!hasColumn("notification_logs", "last_error")) {
+    db.exec("ALTER TABLE notification_logs ADD COLUMN last_error TEXT");
+  }
+  if (!hasColumn("notification_logs", "next_attempt_at")) {
+    db.exec("ALTER TABLE notification_logs ADD COLUMN next_attempt_at TEXT");
+  }
 
   db.prepare(`
     INSERT OR IGNORE INTO retailers (name, base_url, adapter_key, enabled)

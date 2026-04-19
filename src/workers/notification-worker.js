@@ -1,7 +1,8 @@
 require('dotenv').config();
 
 const { getEnv } = require('../config/env');
-const { tasks } = require('../app');
+const { tasks, db } = require('../app');
+const { processQueuedNotifications } = require('../services/notification-dispatcher');
 
 getEnv();
 
@@ -12,6 +13,9 @@ async function runNotificationPass() {
   }
   if (mode === 'all' || mode === 'pokemoncenter') {
     await tasks.sendPokemonCenterDigest();
+  }
+  if (mode === 'all' || mode === 'queued') {
+    await processQueuedNotifications(db, { limit: Number(process.env.NOTIFICATION_QUEUE_BATCH_SIZE || 50) });
   }
 }
 
