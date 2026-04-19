@@ -99,6 +99,18 @@ function getUserById(id) {
   return db.prepare("SELECT * FROM users WHERE id = ?").get(id);
 }
 
+function getUserAlertPreferences(userId) {
+  let prefs = db.prepare("SELECT * FROM user_alert_preferences WHERE user_id = ?").get(userId);
+  if (!prefs) {
+    db.prepare(`
+      INSERT INTO user_alert_preferences (user_id, discord_enabled, email_enabled, sms_enabled, severity, retailer_scope_json)
+      VALUES (?, 1, 0, 0, 'all', '[]')
+    `).run(userId);
+    prefs = db.prepare("SELECT * FROM user_alert_preferences WHERE user_id = ?").get(userId);
+  }
+  return prefs;
+}
+
 function currentUser(req) {
   if (!req.cookies.auth_token) return null;
   try {
@@ -711,6 +723,7 @@ app.post("/logout", (req, res) => {
 
 app.get("/dashboard", requireAuth, (req, res) => {
   const user = ownerOverride(getUserById(req.auth.sub));
+  const prefs = getUserAlertPreferences(user.id);
   const targets = db.prepare("SELECT * FROM alert_targets WHERE user_id = ? ORDER BY created_at DESC").all(user.id);
   const targetSummary = buildTarget24hSummary(user.id);
   const remaining = Math.max(user.alerts_quota - targets.length, 0);
@@ -785,6 +798,23 @@ app.get("/dashboard", requireAuth, (req, res) => {
           </select>
           <label style="margin-top:12px; display:block;">Channel value</label><input name="channel_value" placeholder="Optional for Discord if default webhook is set" />
           <div style="margin-top:16px;"><button>Add target</button></div>
+        </form>
+      </div>
+      <div class="card">
+        <h2>Alert preferences</h2>
+        <form method="post" action="/settings/alert-preferences">
+          <label>Severity</label>
+          <select name="severity">
+            <option value="all" ${prefs.severity === "all" ? "selected" : ""}>All alerts</option>
+            <option value="high" ${prefs.severity === "high" ? "selected" : ""}>High only</option>
+            <option value="medium" ${prefs.severity === "medium" ? "selected" : ""}>Medium+</option>
+          </select>
+          <label style="margin-top:12px; display:block;">Price ceiling (optional)</label>
+          <input name="price_ceiling" type="number" step="0.01" value="${prefs.price_ceiling ?? ""}" />
+          <label style="margin-top:12px; display:block;"><input type="checkbox" name="discord_enabled" ${prefs.discord_enabled ? "checked" : ""}/> Discord</label>
+          <label style="margin-top:6px; display:block;"><input type="checkbox" name="email_enabled" ${prefs.email_enabled ? "checked" : ""}/> Email</label>
+          <label style="margin-top:6px; display:block;"><input type="checkbox" name="sms_enabled" ${prefs.sms_enabled ? "checked" : ""}/> SMS</label>
+          <div style="margin-top:12px;"><button>Save preferences</button></div>
         </form>
       </div>
     </div>
