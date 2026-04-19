@@ -71,6 +71,7 @@ const SAMPLE_TARGET_URLS = [
   "https://www.target.com/p/pok-233-mon-trading-card-game-scarlet-38-violet-8212-destined-rivals-elite-trainer-box/-/A-94300069",
   "https://www.target.com/p/pok-mon-tcg-mega-evolution-ascended-heroes-elite-trainer-box/-/A-1010148053"
 ];
+const inFlightSourceRuns = new Set();
 
 const PLANS = {
   free: {
@@ -1149,6 +1150,51 @@ async function monitorMajorRetailOffer(offerRow) {
   return { transitioned, droppedPrice, state, title, price, oldState };
 }
 
+async function runRetailerSourceCycle(adapterKey, options = {}) {
+  const startedAt = new Date().toISOString();
+  const runInsert = db.prepare(`
+    INSERT INTO monitor_runs (adapter_key, started_at, status, requests_made, errors_count)
+    VALUES (?, ?, 'running', 0, 0)
+  `).run(adapterKey, startedAt);
+
+  let requestsMade = 0;
+  let errorsCount = 0;
+  try {
+    const offers = db.prepare(`
+      SELECT po.*, r.adapter_key, p.canonical_name
+      FROM product_offers po
+      JOIN retailers r ON r.id = po.retailer_id
+      JOIN products p ON p.id = po.product_id
+      WHERE r.adapter_key = ?
+      ORDER BY po.id DESC
+      LIMIT ?
+    `).all(adapterKey, Number(options.limit || 150));
+
+    for (const offer of offers) {
+      try {
+        await monitorMajorRetailOffer(offer);
+        requestsMade += 1;
+      } catch (err) {
+        errorsCount += 1;
+        console.error(`${adapterKey} monitor failed for ${offer.product_url}:`, err.message);
+      }
+    }
+
+    db.prepare(`
+      UPDATE monitor_runs
+      SET finished_at = ?, status = 'ok', requests_made = ?, errors_count = ?
+      WHERE id = ?
+    `).run(new Date().toISOString(), requestsMade, errorsCount, runInsert.lastInsertRowid);
+  } catch (err) {
+    db.prepare(`
+      UPDATE monitor_runs
+      SET finished_at = ?, status = 'failed', requests_made = ?, errors_count = ?
+      WHERE id = ?
+    `).run(new Date().toISOString(), requestsMade, errorsCount + 1, runInsert.lastInsertRowid);
+    throw err;
+  }
+}
+
 async function runMajorRetailMonitorCycle() {
   const startedAt = new Date().toISOString();
   const runInsert = db.prepare(`
@@ -1159,24 +1205,9 @@ async function runMajorRetailMonitorCycle() {
   let requestsMade = 0;
   let errorsCount = 0;
   try {
-    const offers = db.prepare(`
-      SELECT po.*, r.adapter_key, p.canonical_name
-      FROM product_offers po
-      JOIN retailers r ON r.id = po.retailer_id
-      JOIN products p ON p.id = po.product_id
-      WHERE r.adapter_key IN ('bestbuy','target','walmart','gamestop')
-      ORDER BY po.id DESC
-      LIMIT 300
-    `).all();
-
-    for (const offer of offers) {
-      try {
-        await monitorMajorRetailOffer(offer);
-        requestsMade += 1;
-      } catch (err) {
-        errorsCount += 1;
-        console.error(`Major retail monitor failed for ${offer.product_url}:`, err.message);
-      }
+    for (const key of ["bestbuy", "target", "walmart", "gamestop"]) {
+      await runRetailerSourceCycle(key, { limit: 150 });
+      requestsMade += 1;
     }
 
     db.prepare(`
@@ -1198,11 +1229,15 @@ async function runSourceRegistryCycle() {
   const sources = getAllSources(db).filter((s) => s.enabled);
   const jobs = sources.map((source) => (async () => {
     const start = Date.now();
+    if (inFlightSourceRuns.has(source.source_key)) {
+      return { source_key: source.source_key, ok: false, duration_ms: 0, error: "already_running" };
+    }
+    inFlightSourceRuns.add(source.source_key);
     try {
       if (source.source_key === "pokemoncenter") {
         await runPokemonCenterMonitorCycle();
       } else if (["bestbuy", "target", "walmart", "gamestop"].includes(source.source_key)) {
-        await runMajorRetailMonitorCycle();
+        await runRetailerSourceCycle(source.source_key, { limit: 200 });
       } else if (source.source_type === "secondary_market") {
         // Market lane in this build is visibility-focused and derived from market snapshots.
         const latest = db.prepare(`
@@ -1232,6 +1267,8 @@ async function runSourceRegistryCycle() {
       return { source_key: source.source_key, ok: true, duration_ms: Date.now() - start };
     } catch (err) {
       return { source_key: source.source_key, ok: false, duration_ms: Date.now() - start, error: err.message };
+    } finally {
+      inFlightSourceRuns.delete(source.source_key);
     }
   })());
 
@@ -1263,6 +1300,18 @@ function retailerSearchUrl(retailer, productName) {
 
   if (normalizedRetailer.includes("target")) {
     return `https://www.target.com/s?searchTerm=${encodedName}`;
+  }
+  if (normalizedRetailer.includes("walmart")) {
+    return `https://www.walmart.com/search?q=${encodedName}`;
+  }
+  if (normalizedRetailer.includes("bestbuy")) {
+    return `https://www.bestbuy.com/site/searchpage.jsp?st=${encodedName}`;
+  }
+  if (normalizedRetailer.includes("gamestop")) {
+    return `https://www.gamestop.com/search/?q=${encodedName}`;
+  }
+  if (normalizedRetailer.includes("pokemon") || normalizedRetailer.includes("pokémon")) {
+    return `https://www.pokemoncenter.com/search/${encodedName}`;
   }
   return null;
 }
@@ -1656,7 +1705,7 @@ app.get("/dashboard", requireAuth, (req, res) => {
     FROM source_registry sr
     LEFT JOIN monitor_runs mr ON mr.id = (
       SELECT id FROM monitor_runs m2
-      WHERE m2.adapter_key = sr.source_key OR (sr.source_key IN ('bestbuy','target','walmart','gamestop') AND m2.adapter_key = 'major-retail')
+      WHERE m2.adapter_key = sr.source_key
       ORDER BY started_at DESC
       LIMIT 1
     )
@@ -2257,7 +2306,7 @@ app.get("/api/sources/status", requireAuth, (_req, res) => {
     FROM source_registry sr
     LEFT JOIN monitor_runs mr ON mr.id = (
       SELECT id FROM monitor_runs m2
-      WHERE m2.adapter_key = sr.source_key OR (sr.source_key IN ('bestbuy','target','walmart','gamestop') AND m2.adapter_key = 'major-retail')
+      WHERE m2.adapter_key = sr.source_key
       ORDER BY started_at DESC
       LIMIT 1
     )
