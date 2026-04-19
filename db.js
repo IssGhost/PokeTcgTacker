@@ -165,6 +165,18 @@ function createDb(dbPath = "app.db") {
       url TEXT,
       captured_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     );
+
+    CREATE TABLE IF NOT EXISTS monitor_snapshots (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      retailer_key TEXT NOT NULL,
+      product_offer_id INTEGER,
+      product_url TEXT NOT NULL,
+      availability_state TEXT NOT NULL,
+      confidence_score REAL NOT NULL DEFAULT 0.5,
+      raw_signal TEXT NOT NULL,
+      detected_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY(product_offer_id) REFERENCES product_offers(id)
+    );
   `);
 
   if (!hasColumn("users", "discord_webhook")) {

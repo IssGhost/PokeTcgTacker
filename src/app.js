@@ -17,6 +17,13 @@ const {
   shouldAlertTransition,
   shouldAlertPriceDrop
 } = require("../packages/core/state-engine");
+const { parsePokemonCenterSignal } = require("./parsers/pokemoncenter.adapter");
+const { parseTargetSignal } = require("./parsers/target.adapter");
+const { parseBestBuySignal } = require("./parsers/bestbuy.adapter");
+const { parseWalmartSignal } = require("./parsers/walmart.adapter");
+const { parseGameStopSignal } = require("./parsers/gamestop.adapter");
+const { twoPassConfirm, shouldEmitByConfidence, isWithinCooldown } = require("./monitors/noise-gate");
+const { persistRawSnapshot } = require("./services/snapshot-store");
 
 const app = express();
 const db = createDb(path.join(__dirname, "..", "app.db"));
@@ -521,14 +528,52 @@ async function monitorPokemonCenterProduct(productUrl) {
   const html = await fetchText(productUrl);
   const titleMatch = html.match(/<title>([^<]+)<\/title>/i);
   const title = titleMatch ? titleMatch[1].replace(/\s*\|\s*Pokémon Center\s*$/i, "").trim() : "Pokémon Center Product";
-  const state = detectPokemonCenterState(html);
-  const price = parseFirstPrice(html);
-  const snapshotHash = crypto.createHash("sha1").update(html).digest("hex");
+  const parsedSignal = parsePokemonCenterSignal({
+    html,
+    productUrl,
+    title,
+    price: parseFirstPrice(html),
+    sku: null
+  });
+  const snapshotHash = crypto.createHash("sha1").update(parsedSignal.raw_signal).digest("hex");
   const nowIso = new Date().toISOString();
 
-  const { product, offer } = ensureProductAndOffer(productUrl, title, price, state);
+  const { product, offer } = ensureProductAndOffer(
+    productUrl,
+    parsedSignal.title || title,
+    parsedSignal.price,
+    parsedSignal.availability_state
+  );
   const oldState = offer.current_state || STATES.UNKNOWN;
   const oldPrice = typeof offer.last_seen_price === "number" ? offer.last_seen_price : null;
+
+  persistRawSnapshot(db, {
+    retailer_key: "pokemoncenter",
+    product_offer_id: offer.id,
+    product_url: productUrl,
+    availability_state: parsedSignal.availability_state,
+    confidence_score: parsedSignal.confidence_score,
+    raw_signal: parsedSignal.raw_signal,
+    detected_at: nowIso
+  });
+
+  const confirmResult = await twoPassConfirm({
+    initialSignal: parsedSignal,
+    fetchSignalAgain: async () => {
+      const html2 = await fetchText(productUrl);
+      return parsePokemonCenterSignal({
+        html: html2,
+        productUrl,
+        title,
+        price: parseFirstPrice(html2),
+        sku: null
+      });
+    }
+  });
+
+  const signalToUse = confirmResult.confirmed ? parsedSignal : confirmResult.secondSignal;
+  const state = signalToUse.availability_state;
+  const price = signalToUse.price;
 
   db.prepare(`
     UPDATE product_offers
@@ -541,8 +586,15 @@ async function monitorPokemonCenterProduct(productUrl) {
 
   const transitioned = shouldAlertTransition(oldState, state);
   const droppedPrice = shouldAlertPriceDrop(oldPrice, price, 7);
+  const passesConfidence = shouldEmitByConfidence(signalToUse, 0.7);
+  const withinCooldown = isWithinCooldown({
+    db,
+    offerId: offer.id,
+    newState: state,
+    cooldownMs: Number(process.env.ALERT_DEDUPE_COOLDOWN_MS || 600000)
+  });
 
-  if (transitioned || droppedPrice) {
+  if ((transitioned || droppedPrice) && passesConfidence && !withinCooldown) {
     db.prepare(`
       INSERT INTO events (product_offer_id, event_type, old_state, new_state, old_price, new_price, raw_snapshot_hash)
       VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -555,6 +607,13 @@ async function monitorPokemonCenterProduct(productUrl) {
       price,
       snapshotHash
     );
+  }
+
+  if (confirmResult.retracted) {
+    db.prepare(`
+      INSERT INTO events (product_offer_id, event_type, old_state, new_state, old_price, new_price, raw_snapshot_hash)
+      VALUES (?, 'RETRACTED_TENTATIVE', ?, ?, ?, ?, ?)
+    `).run(offer.id, oldState, state, oldPrice, price, `${snapshotHash}:retracted`);
   }
 
   return {
@@ -725,38 +784,77 @@ async function fetchBestBuyProductBySku(sku) {
 async function monitorMajorRetailOffer(offerRow) {
   const nowIso = new Date().toISOString();
   let title = offerRow.canonical_name || "Retail Product";
-  let state = STATES.LISTED;
-  let price = null;
+  let signal = null;
+  let html = "";
+  let apiProduct = null;
 
   if (offerRow.adapter_key === "bestbuy" && offerRow.retailer_sku) {
     try {
-      const bestBuyProduct = await fetchBestBuyProductBySku(offerRow.retailer_sku);
-      if (bestBuyProduct) {
-        title = bestBuyProduct.name || title;
-        price = typeof bestBuyProduct.salePrice === "number" ? bestBuyProduct.salePrice : null;
-        state = bestBuyProduct.onlineAvailability ? STATES.IN_STOCK : STATES.OUT_OF_STOCK;
-      }
+      apiProduct = await fetchBestBuyProductBySku(offerRow.retailer_sku);
+      if (apiProduct) title = apiProduct.name || title;
     } catch (err) {
       console.error(`Best Buy API lookup failed for SKU ${offerRow.retailer_sku}:`, err.message);
     }
   }
 
-  if (state === STATES.LISTED) {
-    const html = await fetchText(offerRow.product_url);
-    price = parseFirstPrice(html);
-    if (offerRow.adapter_key === "target") {
-      const targetState = detectAvailability(html, offerRow.product_url);
-      if (targetState === "in_stock") state = STATES.IN_STOCK;
-      else if (targetState === "pre_order") state = STATES.PREORDER_OPEN;
-      else if (targetState === "out_of_stock") state = STATES.OUT_OF_STOCK;
-      else state = STATES.LISTED;
-    } else {
-      state = detectGenericRetailState(html);
-    }
+  html = await fetchText(offerRow.product_url);
+  const fallbackPrice = parseFirstPrice(html);
+  if (offerRow.adapter_key === "bestbuy") {
+    signal = parseBestBuySignal({
+      apiProduct,
+      html,
+      productUrl: offerRow.product_url,
+      title,
+      price: fallbackPrice,
+      sku: offerRow.retailer_sku
+    });
+  } else if (offerRow.adapter_key === "target") {
+    signal = parseTargetSignal({ html, productUrl: offerRow.product_url, title, price: fallbackPrice });
+  } else if (offerRow.adapter_key === "walmart") {
+    signal = parseWalmartSignal({ html, productUrl: offerRow.product_url, title, price: fallbackPrice });
+  } else {
+    signal = parseGameStopSignal({ html, productUrl: offerRow.product_url, title, price: fallbackPrice });
   }
 
+  const confirmResult = await twoPassConfirm({
+    initialSignal: signal,
+    fetchSignalAgain: async () => {
+      const html2 = await fetchText(offerRow.product_url);
+      if (offerRow.adapter_key === "bestbuy") {
+        return parseBestBuySignal({
+          apiProduct,
+          html: html2,
+          productUrl: offerRow.product_url,
+          title,
+          price: parseFirstPrice(html2),
+          sku: offerRow.retailer_sku
+        });
+      }
+      if (offerRow.adapter_key === "target") {
+        return parseTargetSignal({ html: html2, productUrl: offerRow.product_url, title, price: parseFirstPrice(html2) });
+      }
+      if (offerRow.adapter_key === "walmart") {
+        return parseWalmartSignal({ html: html2, productUrl: offerRow.product_url, title, price: parseFirstPrice(html2) });
+      }
+      return parseGameStopSignal({ html: html2, productUrl: offerRow.product_url, title, price: parseFirstPrice(html2) });
+    }
+  });
+
+  const signalToUse = confirmResult.confirmed ? signal : confirmResult.secondSignal;
+  const state = signalToUse.availability_state;
+  const price = signalToUse.price;
   const oldState = offerRow.current_state || STATES.UNKNOWN;
   const oldPrice = typeof offerRow.last_seen_price === "number" ? offerRow.last_seen_price : null;
+
+  persistRawSnapshot(db, {
+    retailer_key: offerRow.adapter_key,
+    product_offer_id: offerRow.id,
+    product_url: offerRow.product_url,
+    availability_state: state,
+    confidence_score: signalToUse.confidence_score,
+    raw_signal: signalToUse.raw_signal,
+    detected_at: nowIso
+  });
 
   db.prepare(`
     UPDATE product_offers
@@ -769,7 +867,14 @@ async function monitorMajorRetailOffer(offerRow) {
 
   const transitioned = shouldAlertTransition(oldState, state);
   const droppedPrice = shouldAlertPriceDrop(oldPrice, price, 7);
-  if (transitioned || droppedPrice) {
+  const passesConfidence = shouldEmitByConfidence(signalToUse, 0.7);
+  const withinCooldown = isWithinCooldown({
+    db,
+    offerId: offerRow.id,
+    newState: state,
+    cooldownMs: Number(process.env.ALERT_DEDUPE_COOLDOWN_MS || 600000)
+  });
+  if ((transitioned || droppedPrice) && passesConfidence && !withinCooldown) {
     db.prepare(`
       INSERT INTO events (product_offer_id, event_type, old_state, new_state, old_price, new_price, raw_snapshot_hash)
       VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -782,6 +887,13 @@ async function monitorMajorRetailOffer(offerRow) {
       price,
       `${offerRow.adapter_key}:${Date.now()}`
     );
+  }
+
+  if (confirmResult.retracted) {
+    db.prepare(`
+      INSERT INTO events (product_offer_id, event_type, old_state, new_state, old_price, new_price, raw_snapshot_hash)
+      VALUES (?, 'RETRACTED_TENTATIVE', ?, ?, ?, ?, ?)
+    `).run(offerRow.id, oldState, state, oldPrice, price, `${offerRow.adapter_key}:${Date.now()}:retracted`);
   }
 
   return { transitioned, droppedPrice, state, title, price, oldState };
