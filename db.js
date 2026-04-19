@@ -50,6 +50,17 @@ function createDb(dbPath = "app.db") {
       FOREIGN KEY(user_id) REFERENCES users(id)
     );
 
+    CREATE TABLE IF NOT EXISTS alert_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      alert_target_id INTEGER NOT NULL,
+      user_id INTEGER NOT NULL,
+      event_type TEXT NOT NULL,
+      event_message TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY(alert_target_id) REFERENCES alert_targets(id),
+      FOREIGN KEY(user_id) REFERENCES users(id)
+    );
+
     CREATE TABLE IF NOT EXISTS products (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       canonical_name TEXT NOT NULL,
@@ -122,30 +133,6 @@ function createDb(dbPath = "app.db") {
       FOREIGN KEY(user_id) REFERENCES users(id),
       FOREIGN KEY(product_id) REFERENCES products(id)
     );
-
-    CREATE TABLE IF NOT EXISTS release_calendar (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      title TEXT NOT NULL,
-      set_name TEXT,
-      release_date TEXT NOT NULL,
-      notes TEXT,
-      source_url TEXT,
-      created_by_user_id INTEGER,
-      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      FOREIGN KEY(created_by_user_id) REFERENCES users(id)
-    );
-
-    CREATE TABLE IF NOT EXISTS user_alert_preferences (
-      user_id INTEGER PRIMARY KEY,
-      discord_enabled INTEGER NOT NULL DEFAULT 1,
-      email_enabled INTEGER NOT NULL DEFAULT 0,
-      sms_enabled INTEGER NOT NULL DEFAULT 0,
-      severity TEXT NOT NULL DEFAULT 'all',
-      retailer_scope_json TEXT NOT NULL DEFAULT '[]',
-      price_ceiling REAL,
-      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      FOREIGN KEY(user_id) REFERENCES users(id)
-    );
   `);
 
   if (!hasColumn("users", "discord_webhook")) {
@@ -160,16 +147,6 @@ function createDb(dbPath = "app.db") {
   if (!hasColumn("alert_targets", "last_alerted_at")) {
     db.exec("ALTER TABLE alert_targets ADD COLUMN last_alerted_at TEXT");
   }
-
-  db.prepare(`
-    INSERT OR IGNORE INTO retailers (name, base_url, adapter_key, enabled)
-    VALUES
-      ('Pokemon Center', 'https://www.pokemoncenter.com', 'pokemoncenter', 1),
-      ('Best Buy', 'https://www.bestbuy.com', 'bestbuy', 1),
-      ('Target', 'https://www.target.com', 'target', 1),
-      ('Walmart', 'https://www.walmart.com', 'walmart', 1),
-      ('GameStop', 'https://www.gamestop.com', 'gamestop', 1)
-  `).run();
 
   return db;
 }
