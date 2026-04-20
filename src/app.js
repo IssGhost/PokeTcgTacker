@@ -106,6 +106,31 @@ function renderPage(title, body, user = null) {
       ${user ? `<a href="/dashboard">Dashboard</a><a href="/pricing">Pricing</a><form method="post" action="/logout" style="display:inline"><button class="linkbutton">Logout</button></form>` : `<a href="/pricing">Pricing</a><a href="/login">Login</a><a href="/register">Register</a>`}
     </nav>
   `;
+  const appShell = user ? `
+    <div class="app-shell">
+      <aside class="sidebar">
+        <div class="sidebar-logo">PokéAlerts</div>
+        <a href="/dashboard">Dashboard</a>
+        <a href="/pokemoncenter/feed">Feed</a>
+        <a href="/retail/feed">Stores</a>
+        <a href="/api/feeds/raw-sightings">Sightings</a>
+        <a href="/api/notifications/logs">Notifications</a>
+        <a href="/health/dashboard">Ops</a>
+        <a href="/pricing">Billing</a>
+        <form method="post" action="/logout" style="margin-top:auto;"><button class="linkbutton">Logout</button></form>
+      </aside>
+      <main class="app-main">
+        <header class="topbar">
+          <div>
+            <h1>${title}</h1>
+            <p class="muted" style="margin:0;">Monitor drops, manage alerts, and track restocks in real time.</p>
+          </div>
+          <div class="pill">${escapeHtml(user.email || "user")}</div>
+        </header>
+        <div class="wrap">${body}</div>
+      </main>
+    </div>
+  ` : `${nav}<div class="wrap">${body}</div>`;
   return `<!doctype html>
   <html lang="en">
   <head>
@@ -133,6 +158,19 @@ function renderPage(title, body, user = null) {
         color: var(--text);
       }
       .wrap { max-width: 1320px; margin: 0 auto; padding: 24px; }
+      .app-shell { display: grid; grid-template-columns: 250px 1fr; min-height: 100vh; }
+      .sidebar {
+        position: sticky; top: 0; height: 100vh; padding: 20px 16px; border-right: 1px solid var(--border);
+        background: rgba(8, 11, 30, 0.92); display: flex; flex-direction: column; gap: 10px;
+      }
+      .sidebar-logo { font-weight: 800; letter-spacing: 0.4px; margin-bottom: 8px; }
+      .sidebar a, .sidebar .linkbutton { color: #cfd9ff; text-decoration: none; padding: 10px 12px; border-radius: 10px; display: block; text-align: left; }
+      .sidebar a:hover, .sidebar .linkbutton:hover { background: rgba(123,92,255,0.22); }
+      .app-main { min-width: 0; }
+      .topbar {
+        position: sticky; top: 0; z-index: 9; padding: 16px 24px; border-bottom: 1px solid var(--border);
+        background: rgba(10,16,33,0.88); backdrop-filter: blur(10px); display:flex; justify-content: space-between; align-items: center;
+      }
       .nav {
         display:flex; gap:16px; align-items:center; padding:16px 24px;
         background: rgba(10,16,33,0.84);
@@ -157,6 +195,16 @@ function renderPage(title, body, user = null) {
         background-position: center;
       }
       .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(300px,1fr)); gap:18px; }
+      .grid-12 { display:grid; grid-template-columns: repeat(12, minmax(0, 1fr)); gap: 18px; }
+      .col-4 { grid-column: span 4; }
+      .col-5 { grid-column: span 5; }
+      .col-7 { grid-column: span 7; }
+      .col-8 { grid-column: span 8; }
+      .col-12 { grid-column: span 12; }
+      .hero-split { display:grid; grid-template-columns: 2fr 1fr; gap:18px; }
+      .kpi-row { display:grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 14px; margin-top: 16px; }
+      .kpi { padding: 14px; border-radius: 14px; border:1px solid #31457f; background: rgba(11, 17, 40, 0.75); }
+      .kpi .num { font-size: 24px; font-weight: 800; }
       input, select, textarea {
         width:100%; padding:12px; border-radius:12px; border:1px solid #3b4f89;
         background: rgba(8,14,35,0.85); color:#eef2ff;
@@ -173,13 +221,18 @@ function renderPage(title, body, user = null) {
       th, td { text-align:left; padding:10px; border-bottom:1px solid #22305e; }
       ul { padding-left:18px; }
       .pill { display:inline-block; padding:6px 10px; border-radius:999px; background:rgba(86,65,176,0.45); font-size:12px; border:1px solid #5641b0; }
+      @media (max-width: 1180px) {
+        .app-shell { grid-template-columns: 1fr; }
+        .sidebar { position: relative; height: auto; flex-direction: row; flex-wrap: wrap; gap: 6px; }
+        .hero-split { grid-template-columns: 1fr; }
+        .kpi-row { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+        .grid-12 { grid-template-columns: 1fr; }
+        .col-4, .col-5, .col-7, .col-8, .col-12 { grid-column: span 1; }
+      }
     </style>
   </head>
   <body>
-    ${nav}
-    <div class="wrap">
-      ${body}
-    </div>
+    ${appShell}
   </body>
   </html>`;
 }
@@ -1746,15 +1799,36 @@ app.get("/dashboard", requireAuth, (req, res) => {
 
   const body = `
     ${flashHtml}
-    <div class="grid">
-      <div class="card"><h3>Raw sightings today</h3><p>${ingestionCounts.raw_sightings_today || 0}</p></div>
-      <div class="card"><h3>Normalized offers today</h3><p>${ingestionCounts.normalized_offers_today || 0}</p></div>
-      <div class="card"><h3>Alertable events today</h3><p>${ingestionCounts.alertable_events_today || 0}</p></div>
-      <div class="card"><h3>Suppressed events today</h3><p>${ingestionCounts.suppressed_events_today || 0}</p></div>
-      <div class="card"><h3>Marketplace offers today</h3><p>${ingestionCounts.marketplace_offers_today || 0}</p></div>
-      <div class="card"><h3>Monitor errors today</h3><p>${ingestionCounts.monitor_errors_today || 0}</p></div>
-    </div>
-    <div class="grid">
+    <section class="hero-split">
+      <div class="card">
+        <span class="pill">Control Center</span>
+        <h2 style="font-size:32px; margin:10px 0 8px;">Never miss a Pokémon drop</h2>
+        <p class="muted">Create alerts, run monitors, and verify ingestion across official and market lanes in one place.</p>
+        <div style="display:flex; gap:10px; flex-wrap: wrap; margin-top:12px;">
+          <form method="post" action="/catalog/import-target-searches"><button>Create alert set</button></form>
+          <form method="post" action="/sources/run"><button type="submit">Run monitors now</button></form>
+          <form method="post" action="/alerts/target/send-update"><button type="submit">Test notification</button></form>
+        </div>
+      </div>
+      <div class="card">
+        <h3 style="margin-top:0;">Live system status</h3>
+        <p><strong>Active alerts:</strong> ${targets.length}</p>
+        <p><strong>Stores online:</strong> ${sourceHealthRows.filter((row) => row.enabled).length}</p>
+        <p><strong>Notifications today:</strong> ${notificationRows.length}</p>
+        <p><strong>Monitor errors:</strong> ${ingestionCounts.monitor_errors_today || 0}</p>
+      </div>
+    </section>
+    <section class="kpi-row">
+      <div class="kpi"><div class="muted">Raw sightings</div><div class="num">${ingestionCounts.raw_sightings_today || 0}</div></div>
+      <div class="kpi"><div class="muted">Normalized offers</div><div class="num">${ingestionCounts.normalized_offers_today || 0}</div></div>
+      <div class="kpi"><div class="muted">Alertable events</div><div class="num">${ingestionCounts.alertable_events_today || 0}</div></div>
+      <div class="kpi"><div class="muted">Suppressed</div><div class="num">${ingestionCounts.suppressed_events_today || 0}</div></div>
+      <div class="kpi"><div class="muted">Marketplace</div><div class="num">${ingestionCounts.marketplace_offers_today || 0}</div></div>
+      <div class="kpi"><div class="muted">Errors</div><div class="num">${ingestionCounts.monitor_errors_today || 0}</div></div>
+    </section>
+    <h2 style="margin-top:26px;">Actions & Management</h2>
+    <div class="grid-12">
+      <div class="col-7">
       <div class="card">
         <h2>Account</h2>
         <p><strong>${user.email}</strong></p>
@@ -1864,9 +1938,22 @@ app.get("/dashboard", requireAuth, (req, res) => {
           <div style="margin-top:12px;"><button>Save preferences</button></div>
         </form>
       </div>
+      </div>
+      <div class="card col-5">
+        <h2>Operations</h2>
+        <p class="muted">Source health, monitor runs, and live stats.</p>
+        <ul>
+          ${sourceHealthRows.length
+            ? sourceHealthRows.map((row) => `<li>${escapeHtml(row.display_name)} (${escapeHtml(row.source_type)}) — ${escapeHtml(row.status)} — req:${row.requests_made} err:${row.errors_count}</li>`).join("")
+            : "<li class=\"muted\">No source health rows yet.</li>"}
+        </ul>
+        <form method="post" action="/sources/run" style="margin-top:8px;">
+          <button>Run all enabled sources now</button>
+        </form>
+      </div>
     </div>
 
-    <div class="card">
+    <div class="card col-12">
       <h2>Your alert targets</h2>
       <table>
         <thead><tr><th>Name</th><th>Retailer</th><th>URL</th><th>Channel</th><th>Status</th><th>Last scan</th><th>Action</th></tr></thead>
