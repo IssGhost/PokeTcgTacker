@@ -451,8 +451,8 @@ async function sendDiscordAlert(target, options = {}) {
 
   const productName = options.productName || target.name;
   const retailer = options.retailer || target.retailer;
-  const timeAgo = options.timeAgo || "3 hours ago";
-  const headline = options.headline || `This product was dropped at ${retailer} ${timeAgo}. Keep up to date with us.`;
+  const timeAgo = options.timeAgo || "just now";
+  const headline = options.headline || `Stock change detected at ${retailer} (${timeAgo}).`;
 
   const content = [
     headline,
@@ -461,6 +461,82 @@ async function sendDiscordAlert(target, options = {}) {
   ].join("\n");
 
   return postJson(target.channel_value, { content });
+}
+
+function normalizeUrlLoose(value) {
+  return String(value || "").trim().toLowerCase().replace(/\/+$/, "");
+}
+
+function textMatchesAlertName(alertName, observedTitle) {
+  const name = String(alertName || "").trim().toLowerCase();
+  const title = String(observedTitle || "").trim().toLowerCase();
+  if (!name || !title) return false;
+  return title.includes(name) || name.includes(title);
+}
+
+async function deliverAlertTargetNotification(target, user, payload) {
+  const channelType = String(target.channel_type || "discord").trim().toLowerCase();
+  const content = [
+    `Severity: ${payload.severity.toUpperCase()}`,
+    `${payload.retailer} ${payload.newState}: ${payload.productName}`,
+    `URL: ${payload.productUrl}`,
+    `Price: ${payload.newPrice == null ? "N/A" : `$${Number(payload.newPrice).toFixed(2)}`}`,
+    `Transition: ${payload.oldState || STATES.UNKNOWN} -> ${payload.newState}`
+  ].join("\n");
+
+  if (channelType === "discord") {
+    const webhook = getDiscordWebhookForTarget({ ...target, discord_webhook: user.discord_webhook });
+    if (!isValidDiscordWebhookUrl(webhook)) return false;
+    try {
+      await postJson(webhook, { content });
+      logNotification(target.user_id, "discord", content, "sent", { attempts_count: 1 });
+      return true;
+    } catch (err) {
+      queueNotification(db, { userId: target.user_id, channel: "discord", message: content, status: "queued" });
+      return false;
+    }
+  }
+
+  if (channelType === "email") {
+    try {
+      const result = await sendEmailAlert({
+        to: String(target.channel_value || user.email_address || user.email || "").trim(),
+        subject: `Pokemon alert: ${payload.productName} (${payload.newState})`,
+        message: content,
+        userId: target.user_id
+      });
+      if (result.status === "sent") {
+        logNotification(target.user_id, "email", content, result.status, { attempts_count: 1 });
+      } else {
+        queueNotification(db, { userId: target.user_id, channel: "email", message: content, status: "queued" });
+      }
+      return result.status === "sent";
+    } catch {
+      queueNotification(db, { userId: target.user_id, channel: "email", message: content, status: "queued" });
+      return false;
+    }
+  }
+
+  if (channelType === "sms") {
+    try {
+      const result = await sendSmsAlert({
+        to: String(target.channel_value || user.phone_number || "").trim(),
+        message: content,
+        userId: target.user_id
+      });
+      if (result.status === "sent") {
+        logNotification(target.user_id, "sms", content, result.status, { attempts_count: 1 });
+      } else {
+        queueNotification(db, { userId: target.user_id, channel: "sms", message: content, status: "queued" });
+      }
+      return result.status === "sent";
+    } catch {
+      queueNotification(db, { userId: target.user_id, channel: "sms", message: content, status: "queued" });
+      return false;
+    }
+  }
+
+  return false;
 }
 
 function getDiscordWebhookForTarget(target) {
@@ -1198,7 +1274,8 @@ async function monitorMajorRetailOffer(offerRow) {
   if (withinCooldown) suppressionReasons.push("suppressed_by_cooldown");
   if (confirmResult.retracted) suppressionReasons.push("suppressed_by_unverified_second_pass");
 
-  if ((transitioned || droppedPrice) && passesConfidence && !withinCooldown) {
+  const shouldEmitEvent = (transitioned || droppedPrice) && passesConfidence && !withinCooldown;
+  if (shouldEmitEvent) {
     db.prepare(`
       INSERT INTO events (product_offer_id, event_type, old_state, new_state, old_price, new_price, raw_snapshot_hash)
       VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -1211,6 +1288,37 @@ async function monitorMajorRetailOffer(offerRow) {
       price,
       `${offerRow.adapter_key}:${Date.now()}`
     );
+
+    const adapterKeyLower = String(offerRow.adapter_key || "").toLowerCase();
+    const productUrlNormalized = normalizeUrlLoose(offerRow.product_url);
+    const targets = db.prepare(`
+      SELECT at.*, u.discord_webhook, u.email, u.email_address, u.phone_number
+      FROM alert_targets at
+      JOIN users u ON u.id = at.user_id
+      WHERE at.active = 1
+    `).all();
+
+    for (const target of targets) {
+      const targetRetailer = String(target.retailer || "").toLowerCase();
+      const retailerMatches = targetRetailer.includes(adapterKeyLower);
+      const urlMatches = normalizeUrlLoose(target.product_url) === productUrlNormalized;
+      const nameMatches = textMatchesAlertName(target.name, title);
+      if (!(retailerMatches && (urlMatches || nameMatches))) continue;
+
+      const prefs = getUserAlertPreferences(target.user_id);
+      const eventPayload = {
+        productName: title,
+        productUrl: offerRow.product_url,
+        newPrice: price,
+        oldState,
+        newState: state,
+        retailer: offerRow.adapter_key,
+        severity: classifyEventSeverity({ oldState, newState: state, oldPrice, newPrice: price })
+      };
+      if (!shouldDeliverBySeverity(prefs.severity, eventPayload.severity)) continue;
+      if (!shouldDeliverByPriceCeiling(prefs.price_ceiling, eventPayload.newPrice)) continue;
+      await deliverAlertTargetNotification(target, target, eventPayload);
+    }
   }
 
   if (suppressionReasons.length > 0) {
@@ -1241,7 +1349,7 @@ async function monitorMajorRetailOffer(offerRow) {
     dedupe_result: { withinCooldown },
     state_result: { oldState, newState: state, transitioned, droppedPrice },
     alert_decision: {
-      emitted: (transitioned || droppedPrice) && passesConfidence && !withinCooldown,
+      emitted: shouldEmitEvent,
       suppressionReasons
     },
     notification_result: { queued: false }
@@ -1413,6 +1521,16 @@ function retailerSearchUrl(retailer, productName) {
   if (normalizedRetailer.includes("pokemon") || normalizedRetailer.includes("pokémon")) {
     return `https://www.pokemoncenter.com/search/${encodedName}`;
   }
+  return null;
+}
+
+function retailerToAdapterKey(retailer) {
+  const normalizedRetailer = normalizeRetailer(retailer);
+  if (normalizedRetailer.includes("target")) return "target";
+  if (normalizedRetailer.includes("bestbuy")) return "bestbuy";
+  if (normalizedRetailer.includes("walmart")) return "walmart";
+  if (normalizedRetailer.includes("gamestop")) return "gamestop";
+  if (normalizedRetailer.includes("pokemon") || normalizedRetailer.includes("pokémon")) return "pokemoncenter";
   return null;
 }
 
@@ -2242,6 +2360,15 @@ app.post("/alerts", requireAuth, (req, res) => {
     VALUES (?, ?, ?, ?, ?, ?, 1)
   `).run(user.id, payload.name, payload.retailer, payload.product_url, payload.channel_type, finalChannelValue);
 
+  const adapterKey = retailerToAdapterKey(payload.retailer);
+  if (adapterKey) {
+    try {
+      ensureProductAndOffer(payload.product_url, payload.name, null, STATES.LISTED, adapterKey);
+    } catch (err) {
+      console.error(`Offer bootstrap failed for alert target (${adapterKey}):`, err.message);
+    }
+  }
+
   res.redirect("/dashboard");
 });
 
@@ -2388,7 +2515,7 @@ app.post("/alerts/:id/test", requireAuth, async (req, res) => {
     if (!isValidDiscordWebhookUrl(webhook)) {
       return res.redirect("/dashboard?flash=error&message=Discord%20webhook%20URL%20is%20invalid");
     }
-    await sendDiscordAlert({ ...target, channel_value: webhook }, { timeAgo: "3 hours ago" });
+    await sendDiscordAlert({ ...target, channel_value: webhook }, { timeAgo: "moments ago" });
     return res.redirect("/dashboard?flash=success&message=Test%20alert%20sent%20to%20Discord");
   } catch (err) {
     console.error("Test alert send failed:", err);
