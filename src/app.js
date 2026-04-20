@@ -38,7 +38,7 @@ const {
   recordSuppression,
   recordPipelineTrace
 } = require("./services/ingestion-visibility");
-const { LAST_10_RELEASED_SETS, PRODUCT_TYPE_TERMS, buildCatalogQueries } = require("./services/set-catalog");
+const { LAST_10_RELEASED_SETS, PRODUCT_TYPE_TERMS, CURATED_RELEASE_MONITOR_PACK, buildCatalogQueries } = require("./services/set-catalog");
 
 const app = express();
 const db = createDb(path.join(__dirname, "..", "app.db"));
@@ -1534,6 +1534,18 @@ function retailerToAdapterKey(retailer) {
   return null;
 }
 
+function bestBuySkuUrl(sku) {
+  const clean = String(sku || "").replace(/[^0-9]/g, "");
+  if (!clean) return null;
+  return `https://www.bestbuy.com/site/searchpage.jsp?st=${encodeURIComponent(clean)}`;
+}
+
+function walmartItemUrl(itemId) {
+  const clean = String(itemId || "").replace(/[^0-9]/g, "");
+  if (!clean) return null;
+  return `https://www.walmart.com/ip/${clean}`;
+}
+
 function statusLabel(status) {
   if (status === "in_stock") return "IN STOCK";
   if (status === "out_of_stock") return "OUT OF STOCK";
@@ -2189,6 +2201,9 @@ app.get("/dashboard", requireAuth, (req, res) => {
         <form method="post" action="/catalog/import-sample-target-offers" style="margin-top:10px;">
           <button>Import sample Target product links</button>
         </form>
+        <form method="post" action="/catalog/import-curated-release-pack" style="margin-top:10px;">
+          <button>Import curated multi-retailer release pack</button>
+        </form>
       </div>
       <div class="card">
         <h2>Add alert target</h2>
@@ -2474,6 +2489,80 @@ app.post("/catalog/import-sample-target-offers", requireAuth, (req, res) => {
   } catch (err) {
     return res.redirect("/dashboard?flash=error&message=Sample%20Target%20offer%20import%20failed");
   }
+});
+
+app.post("/catalog/import-curated-release-pack", requireAuth, (req, res) => {
+  const user = ownerOverride(getUserById(req.auth.sub));
+  const defaultWebhook = String(user.discord_webhook || "").trim();
+  let offersAdded = 0;
+  let alertsAdded = 0;
+
+  const existingOffers = new Set(db.prepare("SELECT product_url FROM product_offers").all().map((row) => normalizeUrlLoose(row.product_url)));
+  const existingAlerts = new Set(
+    db.prepare("SELECT retailer, product_url FROM alert_targets WHERE user_id = ?").all(user.id)
+      .map((row) => `${normalizeRetailer(row.retailer)}|${normalizeUrlLoose(row.product_url)}`)
+  );
+
+  for (const set of CURATED_RELEASE_MONITOR_PACK) {
+    const records = [
+      {
+        name: `${set.set_name} ETB`,
+        retailer: "Pokemon Center",
+        adapter: "pokemoncenter",
+        product_url: set.pokemoncenter_etb_url,
+        retailer_sku: null
+      },
+      {
+        name: `${set.set_name} ETB`,
+        retailer: "Best Buy",
+        adapter: "bestbuy",
+        product_url: bestBuySkuUrl(set.bestbuy_sku) || retailerSearchUrl("bestbuy", `${set.set_name} elite trainer box`),
+        retailer_sku: set.bestbuy_sku || null
+      },
+      {
+        name: `${set.set_name} ETB`,
+        retailer: "Walmart",
+        adapter: "walmart",
+        product_url: walmartItemUrl(set.walmart_item) || retailerSearchUrl("walmart", `${set.set_name} elite trainer box`),
+        retailer_sku: set.walmart_item || null
+      },
+      {
+        name: `${set.set_name} ETB`,
+        retailer: "Target",
+        adapter: "target",
+        product_url: retailerSearchUrl("target", set.target_query || `${set.set_name} elite trainer box`),
+        retailer_sku: null
+      }
+    ].filter((row) => row.product_url);
+
+    for (const row of records) {
+      const normalizedUrl = normalizeUrlLoose(row.product_url);
+      if (!existingOffers.has(normalizedUrl)) {
+        try {
+          const ensured = ensureProductAndOffer(row.product_url, row.name, null, STATES.LISTED, row.adapter, { retailerSku: row.retailer_sku });
+          if (row.retailer_sku) {
+            db.prepare("UPDATE product_offers SET retailer_sku = COALESCE(retailer_sku, ?) WHERE id = ?").run(row.retailer_sku, ensured.offer.id);
+          }
+          existingOffers.add(normalizedUrl);
+          offersAdded += 1;
+        } catch (err) {
+          console.error(`Curated offer import failed for ${row.retailer} ${row.name}:`, err.message);
+        }
+      }
+
+      const alertKey = `${normalizeRetailer(row.retailer)}|${normalizedUrl}`;
+      if (!existingAlerts.has(alertKey)) {
+        db.prepare(`
+          INSERT INTO alert_targets (user_id, name, retailer, product_url, channel_type, channel_value, active)
+          VALUES (?, ?, ?, ?, 'discord', ?, 1)
+        `).run(user.id, row.name, row.retailer, row.product_url, defaultWebhook);
+        existingAlerts.add(alertKey);
+        alertsAdded += 1;
+      }
+    }
+  }
+
+  return res.redirect(`/dashboard?flash=success&message=Imported%20${offersAdded}%20offers%20and%20${alertsAdded}%20alerts%20from%20curated%20release%20pack`);
 });
 
 app.post("/alerts/target/scan-now", requireAuth, async (req, res) => {
