@@ -186,6 +186,12 @@ function renderPage(title, body, user = null) {
         padding:24px;
         margin-top:20px;
         box-shadow: 0 10px 35px rgba(0,0,0,0.26);
+        transition: transform 160ms ease, box-shadow 160ms ease, border-color 160ms ease;
+      }
+      .hero:hover, .card:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 16px 40px rgba(0,0,0,0.32);
+        border-color: #4b62a8;
       }
       .hero {
         background-image:
@@ -205,6 +211,45 @@ function renderPage(title, body, user = null) {
       .kpi-row { display:grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 14px; margin-top: 16px; }
       .kpi { padding: 14px; border-radius: 14px; border:1px solid #31457f; background: rgba(11, 17, 40, 0.75); }
       .kpi .num { font-size: 24px; font-weight: 800; }
+      .kpi-meta { display:flex; align-items:center; justify-content:space-between; gap:8px; margin-top:6px; font-size:12px; color: var(--muted); }
+      .delta-up { color: #7bf1aa; }
+      .delta-down { color: #ffb3b3; }
+      .delta-flat { color: #c3d2ff; }
+      .status-chip {
+        display:inline-flex; align-items:center; gap:6px; border-radius: 999px; border:1px solid #3554a0;
+        background: rgba(32, 50, 97, 0.55); padding: 4px 10px; font-size: 11px; letter-spacing: 0.2px;
+      }
+      .status-dot { width:8px; height:8px; border-radius:50%; display:inline-block; }
+      .status-ok .status-dot { background:#5ff39f; box-shadow:0 0 12px rgba(95,243,159,0.8); }
+      .status-warn .status-dot { background:#ffd36e; box-shadow:0 0 12px rgba(255,211,110,0.75); }
+      .status-bad .status-dot { background:#ff7f9a; box-shadow:0 0 12px rgba(255,127,154,0.75); }
+      .utility-bar {
+        margin-top: 16px; border:1px solid #2a3f74; border-radius: 14px; padding: 12px;
+        display:grid; grid-template-columns: 2.2fr 1fr 1fr auto auto auto; gap: 10px;
+        background: linear-gradient(180deg, rgba(13,20,45,0.86), rgba(11,18,42,0.7));
+      }
+      .panel-frame {
+        margin-top: 20px; border:1px solid #2b3e73; border-radius: 18px; padding: 16px;
+        background: linear-gradient(180deg, rgba(10,16,37,0.72), rgba(8,14,33,0.58));
+      }
+      .panel-title { display:flex; justify-content:space-between; align-items:center; gap:8px; }
+      .ticker {
+        margin-top: 14px; border-radius: 12px; padding: 10px 12px; border:1px solid #314881;
+        background: rgba(14,22,49,0.8); display:flex; gap:18px; overflow:auto; white-space: nowrap;
+      }
+      .ticker-item { color:#cdd9ff; font-size:13px; }
+      .mini { font-size: 12px; color: var(--muted); }
+      .ops-table td, .ops-table th { font-size: 13px; }
+      .timeline { list-style: none; padding: 0; margin: 0; display:flex; flex-direction: column; gap: 10px; }
+      .timeline li { border:1px solid #2a3d6d; border-radius: 12px; padding: 10px 12px; background: rgba(12,19,42,0.76); }
+      .timeline .when { font-size:11px; color: var(--muted); margin-bottom: 3px; }
+      .split-pane { display:grid; grid-template-columns: 1.6fr 1fr; gap: 16px; }
+      .table-toolbar { display:flex; flex-wrap: wrap; gap:8px; margin: 8px 0 10px; }
+      .table-toolbar input, .table-toolbar select { width:auto; min-width:160px; }
+      .progress {
+        width:100%; height:8px; background: rgba(62,82,136,0.45); border-radius:999px; overflow:hidden; border:1px solid #3b4f89;
+      }
+      .progress > span { display:block; height:100%; background: linear-gradient(90deg, #7b5cff, #21d4fd); }
       input, select, textarea {
         width:100%; padding:12px; border-radius:12px; border:1px solid #3b4f89;
         background: rgba(8,14,35,0.85); color:#eef2ff;
@@ -225,6 +270,8 @@ function renderPage(title, body, user = null) {
         .app-shell { grid-template-columns: 1fr; }
         .sidebar { position: relative; height: auto; flex-direction: row; flex-wrap: wrap; gap: 6px; }
         .hero-split { grid-template-columns: 1fr; }
+        .split-pane { grid-template-columns: 1fr; }
+        .utility-bar { grid-template-columns: 1fr; }
         .kpi-row { grid-template-columns: repeat(2, minmax(0, 1fr)); }
         .grid-12 { grid-template-columns: 1fr; }
         .col-4, .col-5, .col-7, .col-8, .col-12 { grid-column: span 1; }
@@ -1775,13 +1822,115 @@ app.get("/dashboard", requireAuth, (req, res) => {
     </div>
   ` : "";
 
+  const yesterdayCounts = db.prepare(`
+    SELECT
+      (SELECT COUNT(*) FROM raw_sightings WHERE detected_at >= datetime('now', '-1 day', 'start of day') AND detected_at < datetime('now', 'start of day')) AS raw_sightings_yesterday,
+      (SELECT COUNT(*) FROM normalized_offers WHERE updated_at >= datetime('now', '-1 day', 'start of day') AND updated_at < datetime('now', 'start of day')) AS normalized_offers_yesterday,
+      (SELECT COUNT(*) FROM events WHERE created_at >= datetime('now', '-1 day', 'start of day') AND created_at < datetime('now', 'start of day')) AS alertable_events_yesterday,
+      (SELECT COUNT(*) FROM suppression_events WHERE created_at >= datetime('now', '-1 day', 'start of day') AND created_at < datetime('now', 'start of day')) AS suppressed_events_yesterday,
+      (SELECT COUNT(*) FROM raw_sightings WHERE source_type IN ('marketplace', 'secondary_market') AND detected_at >= datetime('now', '-1 day', 'start of day') AND detected_at < datetime('now', 'start of day')) AS marketplace_offers_yesterday,
+      (SELECT COALESCE(SUM(errors_count), 0) FROM monitor_runs WHERE started_at >= datetime('now', '-1 day', 'start of day') AND started_at < datetime('now', 'start of day')) AS monitor_errors_yesterday
+  `).get();
+
+  const buildDelta = (today, yesterday) => {
+    const current = Number(today || 0);
+    const prev = Number(yesterday || 0);
+    const diff = current - prev;
+    const dir = diff > 0 ? "up" : diff < 0 ? "down" : "flat";
+    const sign = diff > 0 ? "+" : "";
+    return {
+      dir,
+      text: `${sign}${diff} vs yesterday`
+    };
+  };
+
+  const todayKpis = [
+    { label: "Raw sightings", today: ingestionCounts.raw_sightings_today, yesterday: yesterdayCounts.raw_sightings_yesterday, status: "ok" },
+    { label: "Normalized offers", today: ingestionCounts.normalized_offers_today, yesterday: yesterdayCounts.normalized_offers_yesterday, status: "ok" },
+    { label: "Alertable events", today: ingestionCounts.alertable_events_today, yesterday: yesterdayCounts.alertable_events_yesterday, status: "ok" },
+    { label: "Suppressed", today: ingestionCounts.suppressed_events_today, yesterday: yesterdayCounts.suppressed_events_yesterday, status: "warn" },
+    { label: "Marketplace", today: ingestionCounts.marketplace_offers_today, yesterday: yesterdayCounts.marketplace_offers_yesterday, status: "warn" },
+    { label: "Errors", today: ingestionCounts.monitor_errors_today, yesterday: yesterdayCounts.monitor_errors_yesterday, status: ingestionCounts.monitor_errors_today > 0 ? "bad" : "ok" }
+  ];
+
+  const kpiHtml = todayKpis.map((item) => {
+    const delta = buildDelta(item.today, item.yesterday);
+    const statusText = item.status === "bad" ? "Needs attention" : item.status === "warn" ? "Watch" : "Healthy";
+    return `
+      <div class="kpi">
+        <div class="muted">${item.label}</div>
+        <div class="num">${Number(item.today || 0)}</div>
+        <div class="kpi-meta">
+          <span class="delta-${delta.dir}">${delta.text}</span>
+          <span class="status-chip status-${item.status}"><span class="status-dot"></span>${statusText}</span>
+        </div>
+      </div>
+    `;
+  }).join("");
+
+  const sourceTableRows = sourceHealthRows.map((row) => {
+    const started = row.started_at ? new Date(row.started_at) : null;
+    const finished = row.finished_at ? new Date(row.finished_at) : null;
+    const runMs = started && finished ? Math.max(finished.getTime() - started.getTime(), 0) : null;
+    const avgLatency = runMs && row.requests_made ? Math.round(runMs / Math.max(row.requests_made, 1)) : null;
+    const successRate = row.requests_made > 0
+      ? Math.max(0, ((row.requests_made - row.errors_count) / row.requests_made) * 100)
+      : (row.errors_count > 0 ? 0 : 100);
+    const statusClass = row.status === "ok" ? "ok" : row.errors_count > 0 ? "warn" : "bad";
+    return `
+      <tr>
+        <td>${escapeHtml(row.display_name)}</td>
+        <td>${escapeHtml(row.source_type)}</td>
+        <td><span class="status-chip status-${statusClass}"><span class="status-dot"></span>${escapeHtml(row.status)}</span></td>
+        <td>${started ? escapeHtml(formatTimeAgo(started)) : "No runs"}</td>
+        <td>${avgLatency != null ? `${avgLatency} ms` : "N/A"}</td>
+        <td>${successRate.toFixed(1)}%</td>
+        <td>${row.errors_count}</td>
+        <td>
+          <form method="post" action="/sources/run"><button type="submit">Run now</button></form>
+        </td>
+      </tr>
+    `;
+  }).join("");
+
+  const timelineEvents = [
+    ...targetSummary.recentEvents.slice(0, 5).map((event) => ({
+      time: event.created_at,
+      message: `${event.name} restock detected`,
+      detail: event.product_url || "Target lane"
+    })),
+    ...notificationRows.slice(0, 4).map((row) => ({
+      time: row.created_at,
+      message: `${row.channel.toUpperCase()} notification ${row.status}`,
+      detail: "Delivery pipeline"
+    })),
+    ...latestMonitorRuns.slice(0, 4).map((run) => ({
+      time: run.started_at,
+      message: `${run.adapter_key} monitor ${run.status}`,
+      detail: `req:${run.requests_made} err:${run.errors_count}`
+    }))
+  ]
+    .filter((row) => row.time)
+    .sort((a, b) => new Date(b.time).getTime() - new Date(a.time).getTime())
+    .slice(0, 10);
+
+  const timelineHtml = timelineEvents.length
+    ? timelineEvents.map((item) => `
+      <li>
+        <div class="when">${escapeHtml(formatTimeAgo(new Date(item.time)))}</div>
+        <div>${escapeHtml(item.message)}</div>
+        <div class="mini">${escapeHtml(item.detail)}</div>
+      </li>
+    `).join("")
+    : `<li><div class="muted">No recent activity yet.</div></li>`;
+
   const rows = targets.length ? targets.map(t => `
     <tr>
       <td>${t.name}</td>
       <td>${t.retailer}</td>
       <td><a href="${t.product_url}" target="_blank" rel="noopener noreferrer">Open</a></td>
       <td>${t.channel_type}</td>
-      <td>${t.active ? "Active" : "Paused"}</td>
+      <td><span class="status-chip ${t.active ? "status-ok" : "status-warn"}"><span class="status-dot"></span>${t.active ? "Active" : "Paused"}</span></td>
       <td>${t.last_scan_status || "unknown"}</td>
       <td>
         <form method="post" action="/alerts/${t.id}/test" style="margin-bottom:8px;">
@@ -1799,15 +1948,31 @@ app.get("/dashboard", requireAuth, (req, res) => {
 
   const body = `
     ${flashHtml}
+    <section class="utility-bar">
+      <input type="text" placeholder="Search alerts, stores, products..." />
+      <select><option>All stores</option><option>Target</option><option>Pokémon Center</option><option>Best Buy</option></select>
+      <select><option>All statuses</option><option>Active</option><option>Paused</option><option>Warning</option></select>
+      <div class="status-chip status-ok"><span class="status-dot"></span>Last updated ${latestMonitorRuns[0]?.started_at ? escapeHtml(formatTimeAgo(new Date(latestMonitorRuns[0].started_at))) : "just now"}</div>
+      <form method="post" action="/sources/run"><button type="submit">Refresh</button></form>
+      <form method="post" action="/catalog/import-target-searches"><button type="submit">Create alert set</button></form>
+    </section>
+    <div class="ticker">
+      ${timelineEvents.slice(0, 6).map((item) => `<span class="ticker-item">● ${escapeHtml(item.message)}</span>`).join("") || `<span class="ticker-item">● Waiting for first events…</span>`}
+    </div>
     <section class="hero-split">
-      <div class="card">
+      <div class="card hero">
         <span class="pill">Control Center</span>
         <h2 style="font-size:32px; margin:10px 0 8px;">Never miss a Pokémon drop</h2>
-        <p class="muted">Create alerts, run monitors, and verify ingestion across official and market lanes in one place.</p>
+        <p class="muted">Monitor ${sourceHealthRows.filter((row) => row.enabled).length} live sources across official + market lanes. Next scheduled run: every 5 minutes.</p>
         <div style="display:flex; gap:10px; flex-wrap: wrap; margin-top:12px;">
           <form method="post" action="/catalog/import-target-searches"><button>Create alert set</button></form>
           <form method="post" action="/sources/run"><button type="submit">Run monitors now</button></form>
           <form method="post" action="/alerts/target/send-update"><button type="submit">Test notification</button></form>
+        </div>
+        <div style="display:grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap:10px; margin-top:14px;">
+          <div><div class="mini">Active targets</div><strong>${targets.length}</strong></div>
+          <div><div class="mini">Last alert fired</div><strong>${timelineEvents[0]?.time ? escapeHtml(formatTimeAgo(new Date(timelineEvents[0].time))) : "No alerts"}</strong></div>
+          <div><div class="mini">Upcoming releases</div><strong>${releases.length}</strong></div>
         </div>
       </div>
       <div class="card">
@@ -1816,27 +1981,28 @@ app.get("/dashboard", requireAuth, (req, res) => {
         <p><strong>Stores online:</strong> ${sourceHealthRows.filter((row) => row.enabled).length}</p>
         <p><strong>Notifications today:</strong> ${notificationRows.length}</p>
         <p><strong>Monitor errors:</strong> ${ingestionCounts.monitor_errors_today || 0}</p>
+        <div class="mini" style="margin-top:8px;">Scan coverage</div>
+        <div class="progress"><span style="width:${Math.min(100, ((sourceHealthRows.filter((r) => r.enabled).length / Math.max(sourceHealthRows.length, 1)) * 100).toFixed(1))}%;"></span></div>
       </div>
     </section>
     <section class="kpi-row">
-      <div class="kpi"><div class="muted">Raw sightings</div><div class="num">${ingestionCounts.raw_sightings_today || 0}</div></div>
-      <div class="kpi"><div class="muted">Normalized offers</div><div class="num">${ingestionCounts.normalized_offers_today || 0}</div></div>
-      <div class="kpi"><div class="muted">Alertable events</div><div class="num">${ingestionCounts.alertable_events_today || 0}</div></div>
-      <div class="kpi"><div class="muted">Suppressed</div><div class="num">${ingestionCounts.suppressed_events_today || 0}</div></div>
-      <div class="kpi"><div class="muted">Marketplace</div><div class="num">${ingestionCounts.marketplace_offers_today || 0}</div></div>
-      <div class="kpi"><div class="muted">Errors</div><div class="num">${ingestionCounts.monitor_errors_today || 0}</div></div>
+      ${kpiHtml}
     </section>
-    <h2 style="margin-top:26px;">Actions & Management</h2>
-    <div class="grid-12">
-      <div class="col-7">
+    <div class="panel-frame">
+      <div class="panel-title">
+        <h2 style="margin:0;">Actions & Management</h2>
+        <span class="status-chip status-ok"><span class="status-dot"></span>Operational</span>
+      </div>
+      <div class="grid-12">
+        <div class="col-7">
       <div class="card">
-        <h2>Account</h2>
-        <p><strong>${user.email}</strong></p>
-        <p>Role: <span class="pill">${user.role}</span></p>
-        <p>Plan: <span class="pill">${user.subscription_tier}</span></p>
-        <p>Status: <span class="pill">${user.subscription_status}</span></p>
-        <p>Quota remaining: ${remaining}</p>
-        <a href="/pricing"><button>Change plan</button></a>
+        <h2>Plan & Usage</h2>
+        <p><strong>${user.email}</strong> · <span class="pill">${user.role}</span></p>
+        <p>Current plan: <span class="pill">${user.subscription_tier}</span> · <span class="pill">${user.subscription_status}</span></p>
+        <p>Alerts used: ${targets.length}/${user.alerts_quota}</p>
+        <div class="progress"><span style="width:${Math.min(100, (targets.length / Math.max(user.alerts_quota, 1)) * 100)}%;"></span></div>
+        <p class="mini" style="margin-top:8px;">Quota remaining: ${remaining}</p>
+        <a href="/pricing"><button>Manage billing</button></a>
       </div>
       <div class="card">
         <h2>Target drop tools</h2>
@@ -1938,43 +2104,53 @@ app.get("/dashboard", requireAuth, (req, res) => {
           <div style="margin-top:12px;"><button>Save preferences</button></div>
         </form>
       </div>
-      </div>
-      <div class="card col-5">
-        <h2>Operations</h2>
-        <p class="muted">Source health, monitor runs, and live stats.</p>
-        <ul>
-          ${sourceHealthRows.length
-            ? sourceHealthRows.map((row) => `<li>${escapeHtml(row.display_name)} (${escapeHtml(row.source_type)}) — ${escapeHtml(row.status)} — req:${row.requests_made} err:${row.errors_count}</li>`).join("")
-            : "<li class=\"muted\">No source health rows yet.</li>"}
-        </ul>
-        <form method="post" action="/sources/run" style="margin-top:8px;">
-          <button>Run all enabled sources now</button>
-        </form>
+        </div>
+        <div class="col-5">
+          <div class="card">
+            <h2>Source Health Matrix</h2>
+            <p class="muted">Operational monitor table with latency + success rates.</p>
+            <table class="ops-table">
+              <thead><tr><th>Source</th><th>Type</th><th>Status</th><th>Last check</th><th>Avg latency</th><th>Success</th><th>Err</th><th>Action</th></tr></thead>
+              <tbody>${sourceTableRows || `<tr><td colspan="8" class="muted">No source health rows yet.</td></tr>`}</tbody>
+            </table>
+          </div>
+          <div class="card">
+            <h2>Recent Activity</h2>
+            <ul class="timeline">${timelineHtml}</ul>
+          </div>
+        </div>
       </div>
     </div>
-
-    <div class="card col-12">
-      <h2>Your alert targets</h2>
+    <div class="panel-frame">
+      <div class="panel-title">
+        <h2 style="margin:0;">Alerts Manager</h2>
+        <form method="post" action="/alerts/target/scan-now"><button type="submit">Run alert scan</button></form>
+      </div>
+      <div class="table-toolbar">
+        <input type="text" placeholder="Search alert name or product..." />
+        <select><option>All statuses</option><option>Active</option><option>Paused</option></select>
+        <select><option>All stores</option><option>Target</option><option>Best Buy</option><option>Walmart</option><option>GameStop</option></select>
+        <form method="post" action="/sources/run"><button type="submit">Bulk resume monitors</button></form>
+      </div>
       <table>
-        <thead><tr><th>Name</th><th>Retailer</th><th>URL</th><th>Channel</th><th>Status</th><th>Last scan</th><th>Action</th></tr></thead>
+        <thead><tr><th>Alert</th><th>Store</th><th>Target</th><th>Channel</th><th>Status</th><th>Last trigger</th><th>Actions</th></tr></thead>
         <tbody>${rows}</tbody>
       </table>
     </div>
 
-    <div class="card">
-      <h2>Target update (last 24 hours + right now)</h2>
-      <p><strong>In-stock detections (24h):</strong> ${targetSummary.recentEvents.length}</p>
-      <p><strong>Current Target drops in stock right now:</strong> ${targetSummary.currentInStock.length}</p>
-      <p><strong>Current Target drops in pre-order right now:</strong> ${targetSummary.currentPreOrder.length}</p>
-      <p><strong>Current Target drops out of stock right now:</strong> ${targetSummary.currentOutOfStock.length}</p>
-      <ul>
-        ${targetSummary.recentEvents.length
-          ? targetSummary.recentEvents.slice(0, 10).map((event) => `<li>${escapeHtml(event.created_at)} — ${escapeHtml(event.name)} — <a href="${event.product_url}" target="_blank" rel="noopener noreferrer">Open</a></li>`).join("")
-          : "<li class=\"muted\">No Target in-stock events recorded in the last 24 hours yet.</li>"}
-      </ul>
-    </div>
-
-    <div class="grid">
+    <div class="split-pane">
+      <div class="card">
+        <h2>Target update (last 24 hours + right now)</h2>
+        <p><strong>In-stock detections (24h):</strong> ${targetSummary.recentEvents.length}</p>
+        <p><strong>Current Target drops in stock right now:</strong> ${targetSummary.currentInStock.length}</p>
+        <p><strong>Current Target drops in pre-order right now:</strong> ${targetSummary.currentPreOrder.length}</p>
+        <p><strong>Current Target drops out of stock right now:</strong> ${targetSummary.currentOutOfStock.length}</p>
+        <ul>
+          ${targetSummary.recentEvents.length
+            ? targetSummary.recentEvents.slice(0, 8).map((event) => `<li>${escapeHtml(event.created_at)} — ${escapeHtml(event.name)} — <a href="${event.product_url}" target="_blank" rel="noopener noreferrer">Open</a></li>`).join("")
+            : "<li class=\"muted\">No Target in-stock events recorded in the last 24 hours yet.</li>"}
+        </ul>
+      </div>
       <div class="card">
         <h2>Release calendar</h2>
         <p class="muted">Upcoming launches.</p>
@@ -1985,6 +2161,8 @@ app.get("/dashboard", requireAuth, (req, res) => {
         </ul>
         <a href="/calendar"><button>Open calendar</button></a>
       </div>
+    </div>
+    <div class="grid">
       <div class="card">
         <h2>Health dashboard</h2>
         <p class="muted">Latest monitor runs.</p>
@@ -1994,17 +2172,6 @@ app.get("/dashboard", requireAuth, (req, res) => {
             : "<li class=\"muted\">No monitor runs yet.</li>"}
         </ul>
         <a href="/health/dashboard"><button>Open health dashboard</button></a>
-      </div>
-      <div class="card">
-        <h2>Source health</h2>
-        <ul>
-          ${sourceHealthRows.length
-            ? sourceHealthRows.map((row) => `<li>${escapeHtml(row.display_name)} (${escapeHtml(row.source_type)}) — ${escapeHtml(row.status)} — req:${row.requests_made} err:${row.errors_count}</li>`).join("")
-            : "<li class=\"muted\">No source health rows yet.</li>"}
-        </ul>
-        <form method="post" action="/sources/run" style="margin-top:8px;">
-          <button>Run all enabled sources now</button>
-        </form>
       </div>
       <div class="card">
         <h2>Market watch (Phase 4)</h2>
