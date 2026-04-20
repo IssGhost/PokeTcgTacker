@@ -2,11 +2,14 @@
   "name": "pokemon-alerts-saas",
   "version": "1.0.0",
   "description": "Subscription-ready Pokemon TCG alert SaaS starter",
-  "main": "server.js",
+  "main": "src/server.js",
   "type": "commonjs",
   "scripts": {
-    "start": "node server.js",
-    "dev": "node server.js"
+    "start": "node src/server.js",
+    "dev": "node src/server.js",
+    "worker:monitor": "node src/workers/monitor-worker.js",
+    "worker:notifications": "node src/workers/notification-worker.js",
+    "test": "node --test"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",
