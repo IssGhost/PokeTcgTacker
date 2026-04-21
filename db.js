@@ -184,6 +184,7 @@ function createDb(dbPath = "app.db") {
       message TEXT NOT NULL,
       status TEXT NOT NULL DEFAULT 'queued',
       created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(user_id, set_name, card_name, card_number),
       FOREIGN KEY(user_id) REFERENCES users(id)
     );
 
