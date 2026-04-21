@@ -152,6 +152,19 @@ function createDb(dbPath = "app.db") {
       FOREIGN KEY(user_id) REFERENCES users(id)
     );
 
+    CREATE TABLE IF NOT EXISTS import_audit_logs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER,
+      action_key TEXT NOT NULL,
+      created_count INTEGER NOT NULL DEFAULT 0,
+      updated_count INTEGER NOT NULL DEFAULT 0,
+      skipped_count INTEGER NOT NULL DEFAULT 0,
+      error_count INTEGER NOT NULL DEFAULT 0,
+      payload_json TEXT,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY(user_id) REFERENCES users(id)
+    );
+
     CREATE TABLE IF NOT EXISTS user_alert_preferences (
       user_id INTEGER PRIMARY KEY,
       discord_enabled INTEGER NOT NULL DEFAULT 1,
@@ -171,6 +184,7 @@ function createDb(dbPath = "app.db") {
       message TEXT NOT NULL,
       status TEXT NOT NULL DEFAULT 'queued',
       created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(user_id, set_name, card_name, card_number),
       FOREIGN KEY(user_id) REFERENCES users(id)
     );
 
@@ -322,6 +336,7 @@ function createDb(dbPath = "app.db") {
     CREATE INDEX IF NOT EXISTS idx_pipeline_traces_created_at ON pipeline_traces(created_at);
     CREATE INDEX IF NOT EXISTS idx_notification_logs_due ON notification_logs(status, next_attempt_at, created_at);
     CREATE INDEX IF NOT EXISTS idx_collection_cards_user_set ON collection_cards(user_id, set_name);
+    CREATE INDEX IF NOT EXISTS idx_import_audit_logs_created_at ON import_audit_logs(created_at);
   `);
 
   db.prepare(`

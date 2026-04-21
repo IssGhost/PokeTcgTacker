@@ -132,6 +132,49 @@ function renderPage(title, body, user = null) {
       </main>
     </div>
   ` : `${nav}<div class="wrap">${body}</div>`;
+  const asyncEnhancer = user ? `
+    <script>
+      (() => {
+        const showToast = (msg, ok = true) => {
+          const el = document.createElement('div');
+          el.textContent = msg;
+          el.style.cssText = 'position:fixed;right:16px;bottom:16px;z-index:9999;padding:10px 14px;border-radius:10px;background:' + (ok ? '#1f8b4c' : '#8b1f2d') + ';color:white;font:600 13px Inter,sans-serif;box-shadow:0 10px 20px rgba(0,0,0,.35)';
+          document.body.appendChild(el);
+          setTimeout(() => el.remove(), 2200);
+        };
+        document.addEventListener('submit', async (e) => {
+          const form = e.target;
+          if (!(form instanceof HTMLFormElement)) return;
+          if ((form.method || '').toLowerCase() !== 'post') return;
+          if (form.action.includes('/login') || form.action.includes('/register') || form.action.includes('/logout') || form.action.includes('/create-checkout-session')) return;
+          e.preventDefault();
+          const submit = form.querySelector('button[type=\"submit\"],button:not([type])');
+          if (submit) submit.disabled = true;
+          try {
+            const body = new URLSearchParams(new FormData(form));
+            const res = await fetch(form.action, { method: 'POST', body, headers: { 'Accept': 'text/html,application/json' } });
+            if (!res.ok) throw new Error('request_failed');
+            const contentType = res.headers.get('content-type') || '';
+            if (contentType.includes('application/json')) {
+              const payload = await res.json();
+              showToast(payload.success === false ? 'Action completed with warnings' : 'Action completed', payload.success !== false);
+            } else {
+              const html = await res.text();
+              const parsed = new DOMParser().parseFromString(html, 'text/html');
+              const nextWrap = parsed.querySelector('.wrap');
+              const curWrap = document.querySelector('.wrap');
+              if (nextWrap && curWrap) curWrap.innerHTML = nextWrap.innerHTML;
+              showToast('Action completed', true);
+            }
+          } catch (err) {
+            showToast('Action failed', false);
+          } finally {
+            if (submit) submit.disabled = false;
+          }
+        });
+      })();
+    </script>
+  ` : '';
   return `<!doctype html>
   <html lang="en">
   <head>
@@ -281,6 +324,7 @@ function renderPage(title, body, user = null) {
   </head>
   <body>
     ${appShell}
+    ${asyncEnhancer}
   </body>
   </html>`;
 }
@@ -696,6 +740,38 @@ function detectAvailability(html, pageUrl = "") {
   return "unknown";
 }
 
+function inferProductTypeFromTitle(title = "") {
+  const text = String(title || "").toLowerCase();
+  if (text.includes("elite trainer")) return "ETB";
+  if (text.includes("booster box") || text.includes("display box")) return "BOOSTER_BOX";
+  if (text.includes("booster bundle")) return "BOOSTER_BUNDLE";
+  if (text.includes("blister") || text.includes("sleeved")) return "SLEEVED_BLISTER";
+  if (text.includes("collection")) return "COLLECTION_BOX";
+  if (text.includes("tin")) return "TIN";
+  return "UNKNOWN";
+}
+
+function isPlausiblePrice(productType, price) {
+  if (price == null || !Number.isFinite(Number(price))) {
+    return { ok: true, reason: null };
+  }
+  const floors = {
+    ETB: 15,
+    BOOSTER_BUNDLE: 10,
+    BOOSTER_BOX: 50,
+    SLEEVED_BLISTER: 2.5,
+    COLLECTION_BOX: 10,
+    TIN: 8,
+    UNKNOWN: 1.5
+  };
+  const numericPrice = Number(price);
+  const floor = floors[productType] ?? floors.UNKNOWN;
+  if (numericPrice < floor) {
+    return { ok: false, reason: `invalid_price_floor_${productType.toLowerCase()}` };
+  }
+  return { ok: true, reason: null };
+}
+
 async function scanAlertTarget(target) {
   try {
     const html = await fetchText(target.product_url);
@@ -906,6 +982,8 @@ async function monitorPokemonCenterProduct(productUrl) {
   const transitioned = shouldAlertTransition(oldState, state);
   const droppedPrice = shouldAlertPriceDrop(oldPrice, price, 7);
   const passesConfidence = shouldEmitByConfidence(signalToUse, 0.7);
+  const productType = inferProductTypeFromTitle(title);
+  const priceValidation = isPlausiblePrice(productType, price);
   const withinCooldown = isWithinCooldown({
     db,
     offerId: offer.id,
@@ -916,10 +994,11 @@ async function monitorPokemonCenterProduct(productUrl) {
   const suppressionReasons = [];
   if (!(transitioned || droppedPrice)) suppressionReasons.push("suppressed_by_transition_rules");
   if (!passesConfidence) suppressionReasons.push("suppressed_by_confidence");
+  if (!priceValidation.ok) suppressionReasons.push(priceValidation.reason);
   if (withinCooldown) suppressionReasons.push("suppressed_by_cooldown");
   if (confirmResult.retracted) suppressionReasons.push("suppressed_by_unverified_second_pass");
 
-  if ((transitioned || droppedPrice) && passesConfidence && !withinCooldown) {
+  if ((transitioned || droppedPrice) && passesConfidence && priceValidation.ok && !withinCooldown) {
     db.prepare(`
       INSERT INTO events (product_offer_id, event_type, old_state, new_state, old_price, new_price, raw_snapshot_hash)
       VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -966,8 +1045,9 @@ async function monitorPokemonCenterProduct(productUrl) {
     dedupe_result: { withinCooldown },
     state_result: { oldState, newState: state, transitioned, droppedPrice },
     alert_decision: {
-      emitted: (transitioned || droppedPrice) && passesConfidence && !withinCooldown,
-      suppressionReasons
+      emitted: (transitioned || droppedPrice) && passesConfidence && priceValidation.ok && !withinCooldown,
+      suppressionReasons,
+      priceValidation
     },
     notification_result: { queued: false }
   });
@@ -1272,10 +1352,11 @@ async function monitorMajorRetailOffer(offerRow) {
   const suppressionReasons = [];
   if (!(transitioned || droppedPrice)) suppressionReasons.push("suppressed_by_transition_rules");
   if (!passesConfidence) suppressionReasons.push("suppressed_by_confidence");
+  if (!priceValidation.ok) suppressionReasons.push(priceValidation.reason);
   if (withinCooldown) suppressionReasons.push("suppressed_by_cooldown");
   if (confirmResult.retracted) suppressionReasons.push("suppressed_by_unverified_second_pass");
 
-  const shouldEmitEvent = (transitioned || droppedPrice) && passesConfidence && !withinCooldown;
+  const shouldEmitEvent = (transitioned || droppedPrice) && passesConfidence && priceValidation.ok && !withinCooldown;
   if (shouldEmitEvent) {
     db.prepare(`
       INSERT INTO events (product_offer_id, event_type, old_state, new_state, old_price, new_price, raw_snapshot_hash)
@@ -1351,7 +1432,8 @@ async function monitorMajorRetailOffer(offerRow) {
     state_result: { oldState, newState: state, transitioned, droppedPrice },
     alert_decision: {
       emitted: shouldEmitEvent,
-      suppressionReasons
+      suppressionReasons,
+      priceValidation
     },
     notification_result: { queued: false }
   });
@@ -1988,6 +2070,13 @@ app.get("/dashboard", requireAuth, (req, res) => {
     ORDER BY sr.source_type ASC, sr.source_key ASC
     LIMIT 12
   `).all();
+  const dataHealth = db.prepare(`
+    SELECT
+      (SELECT COUNT(*) FROM suppression_events WHERE reason LIKE 'invalid_price_floor%' AND created_at >= datetime('now', '-24 hours')) AS invalid_prices_24h,
+      (SELECT COUNT(*) FROM suppression_events WHERE reason = 'suppressed_by_unverified_second_pass' AND created_at >= datetime('now', '-24 hours')) AS parser_mismatch_24h,
+      (SELECT COUNT(*) FROM product_offers WHERE last_seen_at < datetime('now', '-24 hours') OR last_seen_at IS NULL) AS stale_offers,
+      (SELECT COUNT(*) FROM product_offers WHERE current_state = 'UNKNOWN') AS unknown_state_offers
+  `).get();
   const remaining = Math.max(user.alerts_quota - targets.length, 0);
   const flash = String(req.query.flash || "").trim();
   const message = String(req.query.message || "").trim();
@@ -2164,6 +2253,17 @@ app.get("/dashboard", requireAuth, (req, res) => {
     <section class="kpi-row">
       ${kpiHtml}
     </section>
+    <div class="card">
+      <h2>Data health & reconciliation</h2>
+      <div class="kpi-row">
+        <div class="kpi"><div class="muted">Invalid prices (24h)</div><div class="num">${dataHealth.invalid_prices_24h || 0}</div></div>
+        <div class="kpi"><div class="muted">Parser mismatches (24h)</div><div class="num">${dataHealth.parser_mismatch_24h || 0}</div></div>
+        <div class="kpi"><div class="muted">Stale offers</div><div class="num">${dataHealth.stale_offers || 0}</div></div>
+        <div class="kpi"><div class="muted">Unknown-state offers</div><div class="num">${dataHealth.unknown_state_offers || 0}</div></div>
+        <div class="kpi"><div class="muted">Curated sets loaded</div><div class="num">${CURATED_RELEASE_MONITOR_PACK.length}</div></div>
+        <div class="kpi"><div class="muted">Debug endpoint</div><div class="num">/api/monitor/debug/:offerId</div></div>
+      </div>
+    </div>
     <div class="panel-frame">
       <div class="panel-title">
         <h2 style="margin:0;">Actions & Management</h2>
@@ -2543,6 +2643,8 @@ app.post("/catalog/import-curated-release-pack", requireAuth, (req, res) => {
   const defaultWebhook = String(user.discord_webhook || "").trim();
   let offersAdded = 0;
   let alertsAdded = 0;
+  let skipped = 0;
+  let errors = 0;
 
   const existingOffers = new Set(db.prepare("SELECT product_url FROM product_offers").all().map((row) => normalizeUrlLoose(row.product_url)));
   const existingAlerts = new Set(
@@ -2606,7 +2708,10 @@ app.post("/catalog/import-curated-release-pack", requireAuth, (req, res) => {
           offersAdded += 1;
         } catch (err) {
           console.error(`Curated offer import failed for ${row.retailer} ${row.name}:`, err.message);
+          errors += 1;
         }
+      } else {
+        skipped += 1;
       }
 
       const alertKey = `${normalizeRetailer(row.retailer)}|${normalizedUrl}`;
@@ -2617,11 +2722,29 @@ app.post("/catalog/import-curated-release-pack", requireAuth, (req, res) => {
         `).run(user.id, row.name, row.retailer, row.product_url, defaultWebhook);
         existingAlerts.add(alertKey);
         alertsAdded += 1;
+      } else {
+        skipped += 1;
       }
     }
   }
+  const summary = {
+    success: errors === 0,
+    created_count: offersAdded + alertsAdded,
+    updated_count: 0,
+    skipped_count: skipped,
+    error_count: errors,
+    offers_added: offersAdded,
+    alerts_added: alertsAdded
+  };
+  db.prepare(`
+    INSERT INTO import_audit_logs (user_id, action_key, created_count, updated_count, skipped_count, error_count, payload_json)
+    VALUES (?, 'catalog.import_curated_release_pack', ?, ?, ?, ?, ?)
+  `).run(user.id, summary.created_count, summary.updated_count, summary.skipped_count, summary.error_count, JSON.stringify(summary));
 
-  return res.redirect(`/dashboard?flash=success&message=Imported%20${offersAdded}%20offers%20and%20${alertsAdded}%20alerts%20from%20curated%20release%20pack`);
+  if (String(req.query.format || "").toLowerCase() === "json" || req.accepts(["json", "html"]) === "json") {
+    return res.json(summary);
+  }
+  return res.redirect(`/dashboard?flash=success&message=Imported%20${offersAdded}%20offers,%20${alertsAdded}%20alerts,%20${skipped}%20skipped,%20${errors}%20errors`);
 });
 
 app.post("/alerts/target/scan-now", requireAuth, async (req, res) => {
@@ -3132,6 +3255,47 @@ app.get("/api/monitor/snapshots/:id", requireAuth, (req, res) => {
     return res.status(404).json({ error: "snapshot_not_found" });
   }
   return res.json({ row });
+});
+
+app.get("/api/monitor/debug/:offerId", requireAuth, (req, res) => {
+  const offerId = Number(req.params.offerId);
+  const offer = db.prepare(`
+    SELECT po.*, p.canonical_name, p.set_name, p.product_type, r.name AS retailer_name, r.adapter_key
+    FROM product_offers po
+    LEFT JOIN products p ON p.id = po.product_id
+    LEFT JOIN retailers r ON r.id = po.retailer_id
+    WHERE po.id = ?
+  `).get(offerId);
+  if (!offer) {
+    return res.status(404).json({ error: "offer_not_found" });
+  }
+  const snapshots = db.prepare(`
+    SELECT id, availability_state, confidence_score, detected_at, raw_signal
+    FROM monitor_snapshots
+    WHERE product_offer_id = ?
+    ORDER BY detected_at DESC
+    LIMIT 5
+  `).all(offerId);
+  const suppressions = db.prepare(`
+    SELECT reason, details, created_at
+    FROM suppression_events
+    WHERE product_offer_id = ?
+    ORDER BY created_at DESC
+    LIMIT 10
+  `).all(offerId);
+  const traces = db.prepare(`
+    SELECT id, source_key, parse_result_json, normalization_result_json, alert_decision_json, created_at
+    FROM pipeline_traces
+    WHERE product_url = ?
+    ORDER BY created_at DESC
+    LIMIT 5
+  `).all(offer.product_url);
+  return res.json({
+    offer,
+    snapshots,
+    suppressions,
+    traces
+  });
 });
 
 app.get("/api/notifications/logs", requireAuth, (req, res) => {
