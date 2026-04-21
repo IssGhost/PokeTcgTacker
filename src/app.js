@@ -1,0 +1,3474 @@
+require("dotenv").config();
+
+const express = require("express");
+const cookieParser = require("cookie-parser");
+const helmet = require("helmet");
+const bcrypt = require("bcryptjs");
+const Stripe = require("stripe");
+const http = require("http");
+const https = require("https");
+const crypto = require("crypto");
+const path = require("path");
+
+const { createDb } = require("../db");
+const { signAuthCookie, requireAuth } = require("../auth");
+const {
+  STATES,
+  shouldAlertTransition,
+  shouldAlertPriceDrop
+} = require("../packages/core/state-engine");
+const { parsePokemonCenterSignal } = require("./parsers/pokemoncenter.adapter");
+const { parseTargetSignal } = require("./parsers/target.adapter");
+const { parseBestBuySignal } = require("./parsers/bestbuy.adapter");
+const { parseWalmartSignal } = require("./parsers/walmart.adapter");
+const { parseGameStopSignal } = require("./parsers/gamestop.adapter");
+const { twoPassConfirm, shouldEmitByConfidence, isWithinCooldown } = require("./monitors/noise-gate");
+const { persistRawSnapshot } = require("./services/snapshot-store");
+const {
+  classifyEventSeverity,
+  shouldDeliverBySeverity,
+  shouldDeliverByPriceCeiling
+} = require("./services/alert-policy");
+const { sendEmailAlert, sendSmsAlert } = require("./services/multi-channel-notifier");
+const { queueNotification, processQueuedNotifications } = require("./services/notification-dispatcher");
+const { getAllSources, upsertSource } = require("./services/source-registry");
+const {
+  recordRawSighting,
+  upsertNormalizedOffer,
+  recordSuppression,
+  recordPipelineTrace
+} = require("./services/ingestion-visibility");
+const { LAST_10_RELEASED_SETS, PRODUCT_TYPE_TERMS, CURATED_RELEASE_MONITOR_PACK, CURATED_PRODUCT_TYPES, buildCuratedRetailMatrix, buildCatalogQueries } = require("./services/set-catalog");
+
+const app = express();
+const db = createDb(path.join(__dirname, "..", "app.db"));
+
+const stripeKey = process.env.STRIPE_SECRET_KEY || "";
+const stripe = stripeKey ? new Stripe(stripeKey) : null;
+
+const PORT = process.env.PORT || 3000;
+const APP_URL = process.env.APP_URL || `http://localhost:${PORT}`;
+const AUTO_SCAN_ENABLED = String(process.env.AUTO_SCAN_ENABLED || "true").toLowerCase() !== "false";
+const AUTO_SCAN_INTERVAL_MS = Math.max(Number(process.env.AUTO_SCAN_INTERVAL_MS || 300000), 30000);
+const AUTO_SEND_TARGET_UPDATES = String(process.env.AUTO_SEND_TARGET_UPDATES || "true").toLowerCase() !== "false";
+const POKEMON_CENTER_MONITOR_ENABLED = String(process.env.POKEMON_CENTER_MONITOR_ENABLED || "true").toLowerCase() !== "false";
+const POKEMON_CENTER_MONITOR_INTERVAL_MS = Math.max(Number(process.env.POKEMON_CENTER_MONITOR_INTERVAL_MS || 60000), 30000);
+const POKEMON_CENTER_DIGEST_INTERVAL_MS = Math.max(Number(process.env.POKEMON_CENTER_DIGEST_INTERVAL_MS || 21600000), 300000);
+const MAJOR_RETAIL_MONITOR_ENABLED = String(process.env.MAJOR_RETAIL_MONITOR_ENABLED || "true").toLowerCase() !== "false";
+const MAJOR_RETAIL_MONITOR_INTERVAL_MS = Math.max(Number(process.env.MAJOR_RETAIL_MONITOR_INTERVAL_MS || 120000), 30000);
+const SOURCE_REGISTRY_MONITOR_ENABLED = String(process.env.SOURCE_REGISTRY_MONITOR_ENABLED || "true").toLowerCase() !== "false";
+const SOURCE_REGISTRY_MONITOR_INTERVAL_MS = Math.max(Number(process.env.SOURCE_REGISTRY_MONITOR_INTERVAL_MS || 120000), 30000);
+const POKEMON_CENTER_DISCOVERY_URLS = String(
+  process.env.POKEMON_CENTER_DISCOVERY_URLS
+    || "https://www.pokemoncenter.com/sitemap.xml,https://www.pokemoncenter.com/category/trading-card-game,https://www.pokemoncenter.com/category/new-releases,https://www.pokemoncenter.com/category/preorder,https://www.pokemoncenter.com/category/back-in-stock"
+)
+  .split(",")
+  .map((url) => url.trim())
+  .filter(Boolean);
+const SAMPLE_TARGET_URLS = [
+  "https://www.target.com/p/pok-233-mon-trading-card-game-scarlet-38-violet-8212-destined-rivals-booster-bundle/-/A-94300067",
+  "https://www.target.com/p/2025-pokemon-scarlet-violet-s9-3pk-bl-version-1/-/A-93859728",
+  "https://www.target.com/p/pok-233-mon-trading-card-game-scarlet-38-violet-8212-destined-rivals-elite-trainer-box/-/A-94300069",
+  "https://www.target.com/p/pok-mon-tcg-mega-evolution-ascended-heroes-elite-trainer-box/-/A-1010148053"
+];
+const inFlightSourceRuns = new Set();
+
+const PLANS = {
+  free: {
+    id: "free",
+    label: "Free",
+    monthly: "$0",
+    alertsQuota: 5,
+    features: ["Up to 5 alert targets", "Manual config only", "Basic dashboard"]
+  },
+  basic: {
+    id: "basic",
+    label: "Basic",
+    monthly: "$9/mo",
+    alertsQuota: 50,
+    stripePriceEnv: "STRIPE_PRICE_BASIC_MONTHLY",
+    features: ["Up to 50 alert targets", "Discord alert channels", "Priority checks"]
+  },
+  pro: {
+    id: "pro",
+    label: "Pro",
+    monthly: "$19/mo",
+    alertsQuota: 250,
+    stripePriceEnv: "STRIPE_PRICE_PRO_MONTHLY",
+    features: ["Up to 250 alert targets", "Multiple channels", "Advanced retailer groups"]
+  }
+};
+
+function renderPage(title, body, user = null) {
+  const nav = `
+    <nav class="nav">
+      <a href="/">Home</a>
+      ${user ? `<a href="/dashboard">Dashboard</a><a href="/pricing">Pricing</a><form method="post" action="/logout" style="display:inline"><button class="linkbutton">Logout</button></form>` : `<a href="/pricing">Pricing</a><a href="/login">Login</a><a href="/register">Register</a>`}
+    </nav>
+  `;
+  const appShell = user ? `
+    <div class="app-shell">
+      <aside class="sidebar">
+        <div class="sidebar-logo">PokéAlerts</div>
+        <a href="/dashboard">Dashboard</a>
+        <a href="/feed">Feed</a>
+        <a href="/stores">Stores</a>
+        <a href="/sightings">Sightings</a>
+        <a href="/notifications">Notifications</a>
+        <a href="/collection">Collection</a>
+        <a href="/health/dashboard">Ops</a>
+        <a href="/pricing">Billing</a>
+        <form method="post" action="/logout" style="margin-top:auto;"><button class="linkbutton">Logout</button></form>
+      </aside>
+      <main class="app-main">
+        <header class="topbar">
+          <div>
+            <h1>${title}</h1>
+            <p class="muted" style="margin:0;">Monitor drops, manage alerts, and track restocks in real time.</p>
+          </div>
+          <div class="pill">${escapeHtml(user.email || "user")}</div>
+        </header>
+        <div class="wrap">${body}</div>
+      </main>
+    </div>
+  ` : `${nav}<div class="wrap">${body}</div>`;
+  return `<!doctype html>
+  <html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>${title}</title>
+    <style>
+      :root {
+        --bg: #050816;
+        --panel: rgba(17, 23, 48, 0.78);
+        --panel-2: rgba(31, 18, 72, 0.72);
+        --border: #2e3f79;
+        --text: #eef2ff;
+        --muted: #a8b6de;
+        --accent: #7b5cff;
+        --accent-2: #21d4fd;
+      }
+      body {
+        font-family: Inter, "Segoe UI", Arial, sans-serif;
+        margin: 0;
+        background:
+          radial-gradient(circle at 15% 12%, rgba(123,92,255,0.28), transparent 40%),
+          radial-gradient(circle at 85% 3%, rgba(33,212,253,0.16), transparent 30%),
+          linear-gradient(180deg, #050714, #0b1023 45%, #0a1228 100%);
+        color: var(--text);
+      }
+      .wrap { max-width: 1320px; margin: 0 auto; padding: 24px; }
+      .app-shell { display: grid; grid-template-columns: 250px 1fr; min-height: 100vh; }
+      .sidebar {
+        position: sticky; top: 0; height: 100vh; padding: 20px 16px; border-right: 1px solid var(--border);
+        background: rgba(8, 11, 30, 0.92); display: flex; flex-direction: column; gap: 10px;
+      }
+      .sidebar-logo { font-weight: 800; letter-spacing: 0.4px; margin-bottom: 8px; }
+      .sidebar a, .sidebar .linkbutton { color: #cfd9ff; text-decoration: none; padding: 10px 12px; border-radius: 10px; display: block; text-align: left; }
+      .sidebar a:hover, .sidebar .linkbutton:hover { background: rgba(123,92,255,0.22); }
+      .app-main { min-width: 0; }
+      .topbar {
+        position: sticky; top: 0; z-index: 9; padding: 16px 24px; border-bottom: 1px solid var(--border);
+        background: rgba(10,16,33,0.88); backdrop-filter: blur(10px); display:flex; justify-content: space-between; align-items: center;
+      }
+      .nav {
+        display:flex; gap:16px; align-items:center; padding:16px 24px;
+        background: rgba(10,16,33,0.84);
+        backdrop-filter: blur(10px);
+        border-bottom:1px solid var(--border);
+        position: sticky; top: 0; z-index: 10;
+      }
+      .nav a, .linkbutton { color:#d5e3ff; text-decoration:none; background:none; border:none; cursor:pointer; font:inherit; padding:0; }
+      .hero, .card {
+        background: var(--panel);
+        border:1px solid var(--border);
+        border-radius:18px;
+        padding:24px;
+        margin-top:20px;
+        box-shadow: 0 10px 35px rgba(0,0,0,0.26);
+        transition: transform 160ms ease, box-shadow 160ms ease, border-color 160ms ease;
+      }
+      .hero:hover, .card:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 16px 40px rgba(0,0,0,0.32);
+        border-color: #4b62a8;
+      }
+      .hero {
+        background-image:
+          linear-gradient(115deg, rgba(11,17,40,0.95), rgba(16,19,53,0.76)),
+          url('https://images.unsplash.com/photo-1613771404784-3a5686aa2be3?auto=format&fit=crop&w=1400&q=80');
+        background-size: cover;
+        background-position: center;
+      }
+      .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(300px,1fr)); gap:18px; }
+      .grid-12 { display:grid; grid-template-columns: repeat(12, minmax(0, 1fr)); gap: 18px; }
+      .col-4 { grid-column: span 4; }
+      .col-5 { grid-column: span 5; }
+      .col-7 { grid-column: span 7; }
+      .col-8 { grid-column: span 8; }
+      .col-12 { grid-column: span 12; }
+      .hero-split { display:grid; grid-template-columns: 2fr 1fr; gap:18px; }
+      .kpi-row { display:grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 14px; margin-top: 16px; }
+      .kpi { padding: 14px; border-radius: 14px; border:1px solid #31457f; background: rgba(11, 17, 40, 0.75); }
+      .kpi .num { font-size: 24px; font-weight: 800; }
+      .kpi-meta { display:flex; align-items:center; justify-content:space-between; gap:8px; margin-top:6px; font-size:12px; color: var(--muted); }
+      .delta-up { color: #7bf1aa; }
+      .delta-down { color: #ffb3b3; }
+      .delta-flat { color: #c3d2ff; }
+      .status-chip {
+        display:inline-flex; align-items:center; gap:6px; border-radius: 999px; border:1px solid #3554a0;
+        background: rgba(32, 50, 97, 0.55); padding: 4px 10px; font-size: 11px; letter-spacing: 0.2px;
+      }
+      .status-dot { width:8px; height:8px; border-radius:50%; display:inline-block; }
+      .status-ok .status-dot { background:#5ff39f; box-shadow:0 0 12px rgba(95,243,159,0.8); }
+      .status-warn .status-dot { background:#ffd36e; box-shadow:0 0 12px rgba(255,211,110,0.75); }
+      .status-bad .status-dot { background:#ff7f9a; box-shadow:0 0 12px rgba(255,127,154,0.75); }
+      .utility-bar {
+        margin-top: 16px; border:1px solid #2a3f74; border-radius: 14px; padding: 12px;
+        display:grid; grid-template-columns: 2.2fr 1fr 1fr auto auto auto; gap: 10px;
+        background: linear-gradient(180deg, rgba(13,20,45,0.86), rgba(11,18,42,0.7));
+      }
+      .panel-frame {
+        margin-top: 20px; border:1px solid #2b3e73; border-radius: 18px; padding: 16px;
+        background: linear-gradient(180deg, rgba(10,16,37,0.72), rgba(8,14,33,0.58));
+      }
+      .panel-title { display:flex; justify-content:space-between; align-items:center; gap:8px; }
+      .ticker {
+        margin-top: 14px; border-radius: 12px; padding: 10px 12px; border:1px solid #314881;
+        background: rgba(14,22,49,0.8); display:flex; gap:18px; overflow:auto; white-space: nowrap;
+      }
+      .ticker-item { color:#cdd9ff; font-size:13px; }
+      .mini { font-size: 12px; color: var(--muted); }
+      .ops-table td, .ops-table th { font-size: 13px; }
+      .timeline { list-style: none; padding: 0; margin: 0; display:flex; flex-direction: column; gap: 10px; }
+      .timeline li { border:1px solid #2a3d6d; border-radius: 12px; padding: 10px 12px; background: rgba(12,19,42,0.76); }
+      .timeline .when { font-size:11px; color: var(--muted); margin-bottom: 3px; }
+      .split-pane { display:grid; grid-template-columns: 1.6fr 1fr; gap: 16px; }
+      .table-toolbar { display:flex; flex-wrap: wrap; gap:8px; margin: 8px 0 10px; }
+      .table-toolbar input, .table-toolbar select { width:auto; min-width:160px; }
+      .progress {
+        width:100%; height:8px; background: rgba(62,82,136,0.45); border-radius:999px; overflow:hidden; border:1px solid #3b4f89;
+      }
+      .progress > span { display:block; height:100%; background: linear-gradient(90deg, #7b5cff, #21d4fd); }
+      input, select, textarea {
+        width:100%; padding:12px; border-radius:12px; border:1px solid #3b4f89;
+        background: rgba(8,14,35,0.85); color:#eef2ff;
+      }
+      button {
+        background: linear-gradient(90deg, var(--accent), var(--accent-2));
+        color:white; border:none; padding:12px 16px; border-radius:12px; cursor:pointer; font-weight:700;
+      }
+      button:hover { filter: brightness(1.06); transform: translateY(-1px); }
+      .muted { color:var(--muted); }
+      .success { color:#9ff7b4; }
+      .danger { color:#ffb7b7; }
+      table { width:100%; border-collapse:collapse; margin-top:16px; }
+      th, td { text-align:left; padding:10px; border-bottom:1px solid #22305e; }
+      ul { padding-left:18px; }
+      .pill { display:inline-block; padding:6px 10px; border-radius:999px; background:rgba(86,65,176,0.45); font-size:12px; border:1px solid #5641b0; }
+      @media (max-width: 1180px) {
+        .app-shell { grid-template-columns: 1fr; }
+        .sidebar { position: relative; height: auto; flex-direction: row; flex-wrap: wrap; gap: 6px; }
+        .hero-split { grid-template-columns: 1fr; }
+        .split-pane { grid-template-columns: 1fr; }
+        .utility-bar { grid-template-columns: 1fr; }
+        .kpi-row { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+        .grid-12 { grid-template-columns: 1fr; }
+        .col-4, .col-5, .col-7, .col-8, .col-12 { grid-column: span 1; }
+      }
+    </style>
+  </head>
+  <body>
+    ${appShell}
+  </body>
+  </html>`;
+}
+
+function getUserById(id) {
+  return db.prepare("SELECT * FROM users WHERE id = ?").get(id);
+}
+
+function getUserAlertPreferences(userId) {
+  let prefs = db.prepare("SELECT * FROM user_alert_preferences WHERE user_id = ?").get(userId);
+  if (!prefs) {
+    db.prepare(`
+      INSERT INTO user_alert_preferences (user_id, discord_enabled, email_enabled, sms_enabled, severity, retailer_scope_json)
+      VALUES (?, 1, 0, 0, 'all', '[]')
+    `).run(userId);
+    prefs = db.prepare("SELECT * FROM user_alert_preferences WHERE user_id = ?").get(userId);
+  }
+  return prefs;
+}
+
+function logNotification(userId, channel, message, status = "queued", meta = {}) {
+  db.prepare(`
+    INSERT INTO notification_logs (user_id, channel, message, status, attempts_count, last_error, next_attempt_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    userId,
+    channel,
+    message,
+    status,
+    Number(meta.attempts_count || 0),
+    meta.last_error || null,
+    meta.next_attempt_at || null
+  );
+}
+
+function currentUser(req) {
+  if (!req.cookies.auth_token) return null;
+  try {
+    const decoded = require("jsonwebtoken").verify(req.cookies.auth_token, process.env.JWT_SECRET);
+    return getUserById(decoded.sub) || null;
+  } catch {
+    return null;
+  }
+}
+
+function ownerOverride(user) {
+  if (!user) return user;
+  if (user.role === "owner") {
+    return {
+      ...user,
+      subscription_tier: "pro",
+      subscription_status: "active",
+      alerts_quota: 999999
+    };
+  }
+  return user;
+}
+
+function ensureOwnerSeeded() {
+  const email = (process.env.OWNER_EMAIL || "").trim().toLowerCase();
+  const password = process.env.OWNER_PASSWORD || "";
+  if (!email || !password) return;
+  const existing = db.prepare("SELECT * FROM users WHERE email = ?").get(email);
+  if (existing) {
+    db.prepare(`
+      UPDATE users
+      SET role = 'owner',
+          subscription_tier = 'pro',
+          subscription_status = 'active',
+          alerts_quota = 999999
+      WHERE email = ?
+    `).run(email);
+    return;
+  }
+
+  const hash = bcrypt.hashSync(password, 10);
+  db.prepare(`
+    INSERT INTO users (email, password_hash, role, subscription_tier, subscription_status, alerts_quota)
+    VALUES (?, ?, 'owner', 'pro', 'active', 999999)
+  `).run(email, hash);
+}
+
+function ensureReleasedSetCatalogSeeded() {
+  const insertRelease = db.prepare(`
+    INSERT OR IGNORE INTO release_calendar (title, set_name, release_date, notes, source_url, created_by_user_id)
+    VALUES (?, ?, ?, ?, ?, NULL)
+  `);
+  const insertProduct = db.prepare(`
+    INSERT OR IGNORE INTO products (canonical_name, set_name, product_type, brand, canonical_slug)
+    VALUES (?, ?, ?, 'Pokemon', ?)
+  `);
+
+  for (const set of LAST_10_RELEASED_SETS) {
+    insertRelease.run(
+      set.name,
+      set.name,
+      set.release_date,
+      "Auto-seeded released set catalog",
+      "https://www.pokemon.com/us/pokemon-tcg"
+    );
+    for (const type of PRODUCT_TYPE_TERMS) {
+      const title = `${set.name} ${type}`;
+      insertProduct.run(title, set.name, type, slugify(title));
+    }
+  }
+}
+
+function planFromPriceId(priceId) {
+  for (const plan of Object.values(PLANS)) {
+    if (plan.stripePriceEnv && process.env[plan.stripePriceEnv] === priceId) return plan;
+  }
+  return null;
+}
+
+function quotaForPlan(planId) {
+  return PLANS[planId]?.alertsQuota ?? PLANS.free.alertsQuota;
+}
+
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+}
+
+function postJson(url, payload) {
+  return new Promise((resolve, reject) => {
+    let parsedUrl;
+    try {
+      parsedUrl = new URL(url);
+    } catch {
+      reject(new Error("Invalid webhook URL"));
+      return;
+    }
+
+    const body = JSON.stringify(payload);
+    const req = https.request(parsedUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Content-Length": Buffer.byteLength(body)
+      }
+    }, (res) => {
+      let responseBody = "";
+      res.on("data", chunk => {
+        responseBody += chunk;
+      });
+      res.on("end", () => {
+        if (res.statusCode >= 200 && res.statusCode < 300) {
+          resolve({ statusCode: res.statusCode, body: responseBody });
+          return;
+        }
+        reject(new Error(`Webhook POST failed with ${res.statusCode}: ${responseBody}`));
+      });
+    });
+
+    req.on("error", reject);
+    req.write(body);
+    req.end();
+  });
+}
+
+async function sendDiscordAlert(target, options = {}) {
+  if (target.channel_type !== "discord") {
+    throw new Error("Only Discord webhook targets are supported for test sends.");
+  }
+
+  const productName = options.productName || target.name;
+  const retailer = options.retailer || target.retailer;
+  const timeAgo = options.timeAgo || "just now";
+  const headline = options.headline || `Stock change detected at ${retailer} (${timeAgo}).`;
+
+  const content = [
+    headline,
+    `Product: ${productName}`,
+    `Link: ${target.product_url}`
+  ].join("\n");
+
+  return postJson(target.channel_value, { content });
+}
+
+function normalizeUrlLoose(value) {
+  return String(value || "").trim().toLowerCase().replace(/\/+$/, "");
+}
+
+function textMatchesAlertName(alertName, observedTitle) {
+  const name = String(alertName || "").trim().toLowerCase();
+  const title = String(observedTitle || "").trim().toLowerCase();
+  if (!name || !title) return false;
+  return title.includes(name) || name.includes(title);
+}
+
+async function deliverAlertTargetNotification(target, user, payload) {
+  const channelType = String(target.channel_type || "discord").trim().toLowerCase();
+  const content = [
+    `Severity: ${payload.severity.toUpperCase()}`,
+    `${payload.retailer} ${payload.newState}: ${payload.productName}`,
+    `URL: ${payload.productUrl}`,
+    `Price: ${payload.newPrice == null ? "N/A" : `$${Number(payload.newPrice).toFixed(2)}`}`,
+    `Transition: ${payload.oldState || STATES.UNKNOWN} -> ${payload.newState}`
+  ].join("\n");
+
+  if (channelType === "discord") {
+    const webhook = getDiscordWebhookForTarget({ ...target, discord_webhook: user.discord_webhook });
+    if (!isValidDiscordWebhookUrl(webhook)) return false;
+    try {
+      await postJson(webhook, { content });
+      logNotification(target.user_id, "discord", content, "sent", { attempts_count: 1 });
+      return true;
+    } catch (err) {
+      queueNotification(db, { userId: target.user_id, channel: "discord", message: content, status: "queued" });
+      return false;
+    }
+  }
+
+  if (channelType === "email") {
+    try {
+      const result = await sendEmailAlert({
+        to: String(target.channel_value || user.email_address || user.email || "").trim(),
+        subject: `Pokemon alert: ${payload.productName} (${payload.newState})`,
+        message: content,
+        userId: target.user_id
+      });
+      if (result.status === "sent") {
+        logNotification(target.user_id, "email", content, result.status, { attempts_count: 1 });
+      } else {
+        queueNotification(db, { userId: target.user_id, channel: "email", message: content, status: "queued" });
+      }
+      return result.status === "sent";
+    } catch {
+      queueNotification(db, { userId: target.user_id, channel: "email", message: content, status: "queued" });
+      return false;
+    }
+  }
+
+  if (channelType === "sms") {
+    try {
+      const result = await sendSmsAlert({
+        to: String(target.channel_value || user.phone_number || "").trim(),
+        message: content,
+        userId: target.user_id
+      });
+      if (result.status === "sent") {
+        logNotification(target.user_id, "sms", content, result.status, { attempts_count: 1 });
+      } else {
+        queueNotification(db, { userId: target.user_id, channel: "sms", message: content, status: "queued" });
+      }
+      return result.status === "sent";
+    } catch {
+      queueNotification(db, { userId: target.user_id, channel: "sms", message: content, status: "queued" });
+      return false;
+    }
+  }
+
+  return false;
+}
+
+function getDiscordWebhookForTarget(target) {
+  const targetWebhook = String(target.channel_value || "").trim();
+  if (targetWebhook) return targetWebhook;
+  return String(target.discord_webhook || "").trim();
+}
+
+function isValidDiscordWebhookUrl(value) {
+  const urlValue = String(value || "").trim();
+  if (!urlValue) return false;
+  try {
+    const parsed = new URL(urlValue);
+    if (parsed.protocol !== "https:") return false;
+    return parsed.hostname === "discord.com" && parsed.pathname.startsWith("/api/webhooks/");
+  } catch {
+    return false;
+  }
+}
+
+function getRequestClient(url) {
+  return url.startsWith("https:") ? https : http;
+}
+
+function slugify(value) {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/(^-|-$)/g, "")
+    .slice(0, 120);
+}
+
+function parseXmlLocEntries(xml) {
+  const matches = [...String(xml || "").matchAll(/<loc>([^<]+)<\/loc>/g)];
+  return matches.map((match) => String(match[1] || "").trim()).filter(Boolean);
+}
+
+function parseProductLinksFromHtml(html) {
+  const links = [...String(html || "").matchAll(/href="([^"]+)"/g)].map((match) => match[1]);
+  return links
+    .map((href) => {
+      try {
+        return new URL(href, "https://www.pokemoncenter.com").toString();
+      } catch {
+        return null;
+      }
+    })
+    .filter(Boolean)
+    .filter((url) => url.includes("/product/"));
+}
+
+function parseFirstPrice(text) {
+  const match = String(text || "").match(/\$([0-9]+(?:\.[0-9]{2})?)/);
+  if (!match) return null;
+  return Number(match[1]);
+}
+
+function detectPokemonCenterState(html) {
+  const text = String(html || "").toLowerCase();
+  if (text.includes("preorder: add to cart") || text.includes("preorder: add to basket")) {
+    return STATES.PREORDER_OPEN;
+  }
+  if (text.includes("coming soon")) return STATES.COMING_SOON;
+  if (text.includes("add to cart") || text.includes("add to basket")) return STATES.IN_STOCK;
+  if (text.includes("sold out") || text.includes("out of stock") || text.includes("currently unavailable")) {
+    return STATES.OUT_OF_STOCK;
+  }
+  return STATES.LISTED;
+}
+
+function detectGenericRetailState(html) {
+  const text = String(html || "").toLowerCase();
+  if (text.includes("pre-order") || text.includes("preorder")) return STATES.PREORDER_OPEN;
+  if (text.includes("in stock") || text.includes("add to cart") || text.includes("buy now")) return STATES.IN_STOCK;
+  if (text.includes("sold out") || text.includes("out of stock") || text.includes("currently unavailable")) return STATES.OUT_OF_STOCK;
+  return STATES.LISTED;
+}
+
+function fetchText(url, redirectCount = 0) {
+  return new Promise((resolve, reject) => {
+    const client = getRequestClient(url);
+    const req = client.get(url, {
+      headers: {
+        "User-Agent": "PokemonAlertsBot/1.0 (+https://railway.app)"
+      }
+    }, (res) => {
+      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location && redirectCount < 5) {
+        const nextUrl = new URL(res.headers.location, url).toString();
+        resolve(fetchText(nextUrl, redirectCount + 1));
+        return;
+      }
+
+      let body = "";
+      res.on("data", (chunk) => {
+        body += chunk;
+      });
+      res.on("end", () => {
+        if (res.statusCode >= 200 && res.statusCode < 300) {
+          resolve(body);
+          return;
+        }
+        reject(new Error(`Product page fetch failed with ${res.statusCode}`));
+      });
+    });
+
+    req.on("error", reject);
+    req.setTimeout(10000, () => {
+      req.destroy(new Error("Product page fetch timed out"));
+    });
+  });
+}
+
+function detectAvailability(html, pageUrl = "") {
+  const text = String(html || "").toLowerCase();
+  const isTargetPage = String(pageUrl || "").includes("target.com");
+
+  if (isTargetPage) {
+    const statusMatches = [...String(html || "").matchAll(/"availability_status"\s*:\s*"([A-Z_]+)"/g)];
+    const statusCounts = statusMatches.reduce((acc, match) => {
+      const key = String(match[1] || "");
+      acc[key] = (acc[key] || 0) + 1;
+      return acc;
+    }, {});
+
+    if ((statusCounts.IN_STOCK || 0) > 0) return "in_stock";
+    if ((statusCounts.PRE_ORDER || 0) > 0) return "pre_order";
+    if ((statusCounts.OUT_OF_STOCK || 0) > 0) return "out_of_stock";
+  }
+
+  const inStockKeywords = [
+    "in stock",
+    "add to cart",
+    "available now",
+    "pickup available",
+    "ship it"
+  ];
+  const outOfStockKeywords = [
+    "out of stock",
+    "sold out",
+    "currently unavailable",
+    "not available"
+  ];
+  const preOrderKeywords = [
+    "preorder",
+    "pre-order",
+    "pre order"
+  ];
+
+  const hasInStock = inStockKeywords.some((keyword) => text.includes(keyword));
+  const hasOutOfStock = outOfStockKeywords.some((keyword) => text.includes(keyword));
+  const hasPreOrder = preOrderKeywords.some((keyword) => text.includes(keyword));
+
+  if (hasInStock) return "in_stock";
+  if (hasPreOrder) return "pre_order";
+  if (hasOutOfStock) return "out_of_stock";
+  return "unknown";
+}
+
+async function scanAlertTarget(target) {
+  try {
+    const html = await fetchText(target.product_url);
+    return {
+      status: detectAvailability(html, target.product_url),
+      error: null
+    };
+  } catch (err) {
+    return {
+      status: "unknown",
+      error: err
+    };
+  }
+}
+
+function ensureProductAndOffer(productUrl, title, price, state, retailerKey = "pokemoncenter", options = {}) {
+  const retailer = db.prepare("SELECT * FROM retailers WHERE adapter_key = ?").get(retailerKey);
+  if (!retailer) {
+    throw new Error(`Retailer not found for adapter key: ${retailerKey}`);
+  }
+  const canonicalName = String(title || "Unknown Pokémon Center Product").trim();
+  const canonicalSlug = slugify(canonicalName) || slugify(productUrl);
+  let product = db.prepare("SELECT * FROM products WHERE canonical_slug = ?").get(canonicalSlug);
+  if (!product) {
+    const insert = db.prepare(`
+      INSERT INTO products (canonical_name, canonical_slug, brand)
+      VALUES (?, ?, 'Pokemon')
+    `).run(canonicalName, canonicalSlug);
+    product = db.prepare("SELECT * FROM products WHERE id = ?").get(insert.lastInsertRowid);
+  }
+
+  let offer = db.prepare("SELECT * FROM product_offers WHERE product_url = ?").get(productUrl);
+  if (!offer) {
+    const insert = db.prepare(`
+      INSERT INTO product_offers (product_id, retailer_id, retailer_sku, product_url, last_seen_price, current_state, last_seen_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run(product.id, retailer.id, options.retailerSku || null, productUrl, price, state, new Date().toISOString());
+    offer = db.prepare("SELECT * FROM product_offers WHERE id = ?").get(insert.lastInsertRowid);
+  }
+
+  return { product, offer };
+}
+
+async function sendPokemonCenterDiscordEvent(userId, event) {
+  const user = db.prepare("SELECT * FROM users WHERE id = ?").get(userId);
+  const prefs = getUserAlertPreferences(userId);
+  const webhook = String(user?.discord_webhook || "").trim();
+  const severity = classifyEventSeverity(event);
+  if (!shouldDeliverBySeverity(prefs.severity, severity)) {
+    return;
+  }
+  if (!shouldDeliverByPriceCeiling(prefs.price_ceiling, event.newPrice)) {
+    return;
+  }
+
+  const content = [
+    `Severity: ${severity.toUpperCase()}`,
+    `Pokémon Center ${event.newState}: ${event.productName}`,
+    `URL: ${event.productUrl}`,
+    `Price: ${event.newPrice == null ? "N/A" : `$${event.newPrice.toFixed(2)}`}`,
+    `Transition: ${event.oldState || STATES.UNKNOWN} -> ${event.newState}`
+  ].join("\n");
+
+  if (prefs.discord_enabled && isValidDiscordWebhookUrl(webhook)) {
+    try {
+      await postJson(webhook, { content });
+      logNotification(userId, "discord", content, "sent", { attempts_count: 1 });
+    } catch (err) {
+      queueNotification(db, { userId, channel: "discord", message: content, status: "queued" });
+    }
+  }
+
+  if (prefs.email_enabled) {
+    try {
+      const result = await sendEmailAlert({
+        to: String(user?.email_address || user?.email || "").trim(),
+        subject: `Pokemon alert: ${event.productName} (${event.newState})`,
+        message: content,
+        userId
+      });
+      if (result.status === "sent") {
+        logNotification(userId, "email", content, result.status, { attempts_count: 1 });
+      } else {
+        queueNotification(db, { userId, channel: "email", message: content, status: "queued" });
+      }
+    } catch (err) {
+      queueNotification(db, { userId, channel: "email", message: content, status: "queued" });
+    }
+  }
+
+  if (prefs.sms_enabled) {
+    try {
+      const result = await sendSmsAlert({
+        to: String(user?.phone_number || "").trim(),
+        message: content,
+        userId
+      });
+      if (result.status === "sent") {
+        logNotification(userId, "sms", content, result.status, { attempts_count: 1 });
+      } else {
+        queueNotification(db, { userId, channel: "sms", message: content, status: "queued" });
+      }
+    } catch (err) {
+      queueNotification(db, { userId, channel: "sms", message: content, status: "queued" });
+    }
+  }
+}
+
+async function monitorPokemonCenterProduct(productUrl) {
+  const html = await fetchText(productUrl);
+  const titleMatch = html.match(/<title>([^<]+)<\/title>/i);
+  const title = titleMatch ? titleMatch[1].replace(/\s*\|\s*Pokémon Center\s*$/i, "").trim() : "Pokémon Center Product";
+  const parsedSignal = parsePokemonCenterSignal({
+    html,
+    productUrl,
+    title,
+    price: parseFirstPrice(html),
+    sku: null
+  });
+  const snapshotHash = crypto.createHash("sha1").update(parsedSignal.raw_signal).digest("hex");
+  const nowIso = new Date().toISOString();
+
+  const { product, offer } = ensureProductAndOffer(
+    productUrl,
+    parsedSignal.title || title,
+    parsedSignal.price,
+    parsedSignal.availability_state
+  );
+  const oldState = offer.current_state || STATES.UNKNOWN;
+  const oldPrice = typeof offer.last_seen_price === "number" ? offer.last_seen_price : null;
+  const sourceKey = "pokemoncenter";
+  const sourceType = "official_retailer";
+
+  recordRawSighting(db, {
+    source_key: sourceKey,
+    source_type: sourceType,
+    scrape_url: productUrl,
+    product_url: productUrl,
+    title: parsedSignal.title || title,
+    seller_name: "Pokemon Center",
+    seller_type: "first_party",
+    price: parsedSignal.price,
+    currency: parsedSignal.currency || "USD",
+    availability_state: parsedSignal.availability_state,
+    confidence_score: parsedSignal.confidence_score,
+    parser_version: "pokemoncenter.adapter:v1",
+    raw_signal: parsedSignal.raw_signal
+  });
+
+  upsertNormalizedOffer(db, {
+    source_key: sourceKey,
+    source_type: sourceType,
+    product_offer_id: offer.id,
+    product_id: product.id,
+    product_url: productUrl,
+    external_id: parsedSignal.external_id,
+    title: parsedSignal.title || title,
+    variant: parsedSignal.variant,
+    image_url: parsedSignal.image_url,
+    seller_name: "Pokemon Center",
+    seller_type: "first_party",
+    price: parsedSignal.price,
+    shipping_price: 0,
+    total_price: parsedSignal.price,
+    currency: parsedSignal.currency || "USD",
+    availability_state: parsedSignal.availability_state,
+    confidence_score: parsedSignal.confidence_score,
+    parser_version: "pokemoncenter.adapter:v1"
+  });
+
+  persistRawSnapshot(db, {
+    retailer_key: "pokemoncenter",
+    product_offer_id: offer.id,
+    product_url: productUrl,
+    availability_state: parsedSignal.availability_state,
+    confidence_score: parsedSignal.confidence_score,
+    raw_signal: parsedSignal.raw_signal,
+    detected_at: nowIso
+  });
+
+  const confirmResult = await twoPassConfirm({
+    initialSignal: parsedSignal,
+    fetchSignalAgain: async () => {
+      const html2 = await fetchText(productUrl);
+      return parsePokemonCenterSignal({
+        html: html2,
+        productUrl,
+        title,
+        price: parseFirstPrice(html2),
+        sku: null
+      });
+    }
+  });
+
+  const signalToUse = confirmResult.confirmed ? parsedSignal : confirmResult.secondSignal;
+  const state = signalToUse.availability_state;
+  const price = signalToUse.price;
+
+  db.prepare(`
+    UPDATE product_offers
+    SET last_seen_price = ?,
+        current_state = ?,
+        last_seen_at = ?,
+        last_in_stock_at = CASE WHEN ? = ? THEN ? ELSE last_in_stock_at END
+    WHERE id = ?
+  `).run(price, state, nowIso, state, STATES.IN_STOCK, nowIso, offer.id);
+
+  const transitioned = shouldAlertTransition(oldState, state);
+  const droppedPrice = shouldAlertPriceDrop(oldPrice, price, 7);
+  const passesConfidence = shouldEmitByConfidence(signalToUse, 0.7);
+  const withinCooldown = isWithinCooldown({
+    db,
+    offerId: offer.id,
+    newState: state,
+    cooldownMs: Number(process.env.ALERT_DEDUPE_COOLDOWN_MS || 600000)
+  });
+
+  const suppressionReasons = [];
+  if (!(transitioned || droppedPrice)) suppressionReasons.push("suppressed_by_transition_rules");
+  if (!passesConfidence) suppressionReasons.push("suppressed_by_confidence");
+  if (withinCooldown) suppressionReasons.push("suppressed_by_cooldown");
+  if (confirmResult.retracted) suppressionReasons.push("suppressed_by_unverified_second_pass");
+
+  if ((transitioned || droppedPrice) && passesConfidence && !withinCooldown) {
+    db.prepare(`
+      INSERT INTO events (product_offer_id, event_type, old_state, new_state, old_price, new_price, raw_snapshot_hash)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      offer.id,
+      droppedPrice && !transitioned ? STATES.PRICE_CHANGED : "STATE_CHANGED",
+      oldState,
+      state,
+      oldPrice,
+      price,
+      snapshotHash
+    );
+  }
+
+  if (suppressionReasons.length > 0) {
+    suppressionReasons.forEach((reason) => {
+      recordSuppression(db, {
+        source_key: sourceKey,
+        product_offer_id: offer.id,
+        product_url: productUrl,
+        reason,
+        details: { oldState, state, oldPrice, price, confidence: signalToUse.confidence_score }
+      });
+    });
+  }
+
+  if (confirmResult.retracted) {
+    db.prepare(`
+      INSERT INTO events (product_offer_id, event_type, old_state, new_state, old_price, new_price, raw_snapshot_hash)
+      VALUES (?, 'RETRACTED_TENTATIVE', ?, ?, ?, ?, ?)
+    `).run(offer.id, oldState, state, oldPrice, price, `${snapshotHash}:retracted`);
+  }
+
+  recordPipelineTrace(db, {
+    source_key: sourceKey,
+    product_url: productUrl,
+    source_hit: { productUrl, nowIso },
+    parse_result: parsedSignal,
+    normalization_result: {
+      state,
+      price,
+      confidence: signalToUse.confidence_score
+    },
+    dedupe_result: { withinCooldown },
+    state_result: { oldState, newState: state, transitioned, droppedPrice },
+    alert_decision: {
+      emitted: (transitioned || droppedPrice) && passesConfidence && !withinCooldown,
+      suppressionReasons
+    },
+    notification_result: { queued: false }
+  });
+
+  return {
+    product,
+    offerId: offer.id,
+    state,
+    oldState,
+    price,
+    oldPrice,
+    transitioned,
+    droppedPrice,
+    snapshotHash
+  };
+}
+
+async function discoverPokemonCenterProductUrls() {
+  const found = new Set();
+
+  for (const sourceUrl of POKEMON_CENTER_DISCOVERY_URLS) {
+    try {
+      const payload = await fetchText(sourceUrl);
+      const urls = sourceUrl.endsWith(".xml")
+        ? parseXmlLocEntries(payload)
+        : parseProductLinksFromHtml(payload);
+      urls.forEach((url) => {
+        if (url.includes("pokemoncenter.com") && url.includes("/product/")) {
+          found.add(url.split("?")[0]);
+        }
+      });
+    } catch (err) {
+      console.error(`Pokemon Center discovery failed for ${sourceUrl}:`, err.message);
+    }
+  }
+
+  return [...found];
+}
+
+async function runPokemonCenterDiscovery() {
+  const urls = await discoverPokemonCenterProductUrls();
+  for (const url of urls) {
+    ensureProductAndOffer(url, "Pokemon Center Listing", null, STATES.LISTED);
+  }
+  return urls.length;
+}
+
+function sixHoursAgoIso() {
+  return new Date(Date.now() - 6 * 60 * 60 * 1000).toISOString();
+}
+
+async function sendPokemonCenterDigest() {
+  const users = db.prepare(`
+    SELECT id, discord_webhook
+    FROM users
+    WHERE discord_webhook IS NOT NULL AND trim(discord_webhook) != ''
+  `).all();
+  const since = sixHoursAgoIso();
+
+  const counts = db.prepare(`
+    SELECT event_type, COUNT(*) AS c
+    FROM events
+    WHERE created_at >= ?
+    GROUP BY event_type
+  `).all(since);
+  const stateChanged = counts.find((row) => row.event_type === "STATE_CHANGED")?.c || 0;
+  const priceChanged = counts.find((row) => row.event_type === STATES.PRICE_CHANGED)?.c || 0;
+  const monitorRuns = db.prepare("SELECT COUNT(*) AS c FROM monitor_runs WHERE started_at >= ?").get(since).c;
+  const topItems = db.prepare(`
+    SELECT p.canonical_name, COUNT(*) AS c
+    FROM events e
+    JOIN product_offers po ON po.id = e.product_offer_id
+    JOIN products p ON p.id = po.product_id
+    WHERE e.created_at >= ?
+    GROUP BY p.canonical_name
+    ORDER BY c DESC
+    LIMIT 5
+  `).all(since);
+  const topLines = topItems.length
+    ? topItems.map((item, idx) => `${idx + 1}. ${item.canonical_name} (${item.c})`).join("\n")
+    : "No events in the last 6 hours";
+
+  for (const user of users) {
+    if (!isValidDiscordWebhookUrl(user.discord_webhook)) continue;
+    const content = [
+      "Pokémon Center 6-hour digest",
+      `Monitor runs: ${monitorRuns}`,
+      `State-change alerts: ${stateChanged}`,
+      `Price-change alerts: ${priceChanged}`,
+      "Top items:",
+      topLines
+    ].join("\n");
+    await postJson(user.discord_webhook, { content });
+  }
+}
+
+async function runPokemonCenterMonitorCycle() {
+  const startedAt = new Date().toISOString();
+  const runInsert = db.prepare(`
+    INSERT INTO monitor_runs (adapter_key, started_at, status, requests_made, errors_count)
+    VALUES ('pokemoncenter', ?, 'running', 0, 0)
+  `).run(startedAt);
+
+  let requestsMade = 0;
+  let errorsCount = 0;
+  try {
+    const discoveryCount = await runPokemonCenterDiscovery();
+    const offers = db.prepare(`
+      SELECT po.id, po.product_url
+      FROM product_offers po
+      JOIN retailers r ON r.id = po.retailer_id
+      WHERE r.adapter_key = 'pokemoncenter'
+      ORDER BY po.id DESC
+      LIMIT 200
+    `).all();
+
+    for (const offer of offers) {
+      try {
+        const result = await monitorPokemonCenterProduct(offer.product_url);
+        requestsMade += 1;
+        if (result.transitioned || result.droppedPrice) {
+          const watchers = db.prepare(`
+            SELECT DISTINCT w.user_id
+            FROM watchlists w
+            JOIN products p ON p.id = w.product_id
+            JOIN product_offers po ON po.product_id = p.id
+            WHERE po.id = ?
+          `).all(result.offerId);
+          for (const watcher of watchers) {
+            await sendPokemonCenterDiscordEvent(watcher.user_id, {
+              productName: result.product.canonical_name,
+              productUrl: offer.product_url,
+              newPrice: result.price,
+              oldState: result.oldState,
+              newState: result.state
+            });
+          }
+        }
+      } catch (err) {
+        errorsCount += 1;
+        console.error(`Pokemon Center monitor failed for ${offer.product_url}:`, err.message);
+      }
+    }
+
+    db.prepare(`
+      UPDATE monitor_runs
+      SET finished_at = ?, status = 'ok', requests_made = ?, errors_count = ?
+      WHERE id = ?
+    `).run(new Date().toISOString(), requestsMade + discoveryCount, errorsCount, runInsert.lastInsertRowid);
+  } catch (err) {
+    db.prepare(`
+      UPDATE monitor_runs
+      SET finished_at = ?, status = 'failed', requests_made = ?, errors_count = ?
+      WHERE id = ?
+    `).run(new Date().toISOString(), requestsMade, errorsCount + 1, runInsert.lastInsertRowid);
+    throw err;
+  }
+}
+
+async function fetchBestBuyProductBySku(sku) {
+  const apiKey = String(process.env.BESTBUY_API_KEY || "").trim();
+  if (!apiKey || !sku) return null;
+  const endpoint = `https://api.bestbuy.com/v1/products(sku=${encodeURIComponent(sku)})?format=json&show=sku,name,salePrice,onlineAvailability,url&apiKey=${apiKey}`;
+  const payload = await fetchText(endpoint);
+  const parsed = JSON.parse(payload);
+  if (!Array.isArray(parsed.products) || parsed.products.length === 0) return null;
+  return parsed.products[0];
+}
+
+async function monitorMajorRetailOffer(offerRow) {
+  const nowIso = new Date().toISOString();
+  let title = offerRow.canonical_name || "Retail Product";
+  let signal = null;
+  let html = "";
+  let apiProduct = null;
+
+  if (offerRow.adapter_key === "bestbuy" && offerRow.retailer_sku) {
+    try {
+      apiProduct = await fetchBestBuyProductBySku(offerRow.retailer_sku);
+      if (apiProduct) title = apiProduct.name || title;
+    } catch (err) {
+      console.error(`Best Buy API lookup failed for SKU ${offerRow.retailer_sku}:`, err.message);
+    }
+  }
+
+  html = await fetchText(offerRow.product_url);
+  const fallbackPrice = parseFirstPrice(html);
+  if (offerRow.adapter_key === "bestbuy") {
+    signal = parseBestBuySignal({
+      apiProduct,
+      html,
+      productUrl: offerRow.product_url,
+      title,
+      price: fallbackPrice,
+      sku: offerRow.retailer_sku
+    });
+  } else if (offerRow.adapter_key === "target") {
+    signal = parseTargetSignal({ html, productUrl: offerRow.product_url, title, price: fallbackPrice });
+  } else if (offerRow.adapter_key === "walmart") {
+    signal = parseWalmartSignal({ html, productUrl: offerRow.product_url, title, price: fallbackPrice });
+  } else {
+    signal = parseGameStopSignal({ html, productUrl: offerRow.product_url, title, price: fallbackPrice });
+  }
+
+  const confirmResult = await twoPassConfirm({
+    initialSignal: signal,
+    fetchSignalAgain: async () => {
+      const html2 = await fetchText(offerRow.product_url);
+      if (offerRow.adapter_key === "bestbuy") {
+        return parseBestBuySignal({
+          apiProduct,
+          html: html2,
+          productUrl: offerRow.product_url,
+          title,
+          price: parseFirstPrice(html2),
+          sku: offerRow.retailer_sku
+        });
+      }
+      if (offerRow.adapter_key === "target") {
+        return parseTargetSignal({ html: html2, productUrl: offerRow.product_url, title, price: parseFirstPrice(html2) });
+      }
+      if (offerRow.adapter_key === "walmart") {
+        return parseWalmartSignal({ html: html2, productUrl: offerRow.product_url, title, price: parseFirstPrice(html2) });
+      }
+      return parseGameStopSignal({ html: html2, productUrl: offerRow.product_url, title, price: parseFirstPrice(html2) });
+    }
+  });
+
+  const signalToUse = confirmResult.confirmed ? signal : confirmResult.secondSignal;
+  const state = signalToUse.availability_state;
+  const price = signalToUse.price;
+  const oldState = offerRow.current_state || STATES.UNKNOWN;
+  const oldPrice = typeof offerRow.last_seen_price === "number" ? offerRow.last_seen_price : null;
+  const marketplaceDetected = /sold and shipped by|marketplace seller|third-party seller|other sellers/i.test(String(html || ""));
+  const sourceType = marketplaceDetected ? "marketplace" : "official_retailer";
+
+  recordRawSighting(db, {
+    source_key: offerRow.adapter_key,
+    source_type: sourceType,
+    scrape_url: offerRow.product_url,
+    product_url: offerRow.product_url,
+    title,
+    seller_name: marketplaceDetected ? "Marketplace Seller" : offerRow.adapter_key,
+    seller_type: marketplaceDetected ? "third_party" : "first_party",
+    price,
+    currency: signalToUse.currency || "USD",
+    availability_state: state,
+    confidence_score: signalToUse.confidence_score,
+    parser_version: `${offerRow.adapter_key}.adapter:v1`,
+    raw_signal: signalToUse.raw_signal
+  });
+
+  upsertNormalizedOffer(db, {
+    source_key: offerRow.adapter_key,
+    source_type: sourceType,
+    product_offer_id: offerRow.id,
+    product_id: offerRow.product_id,
+    product_url: offerRow.product_url,
+    external_id: signalToUse.external_id || offerRow.retailer_sku || null,
+    title,
+    variant: signalToUse.variant,
+    image_url: signalToUse.image_url,
+    seller_name: marketplaceDetected ? "Marketplace Seller" : offerRow.adapter_key,
+    seller_type: marketplaceDetected ? "third_party" : "first_party",
+    price,
+    shipping_price: null,
+    total_price: price,
+    currency: signalToUse.currency || "USD",
+    availability_state: state,
+    confidence_score: signalToUse.confidence_score,
+    parser_version: `${offerRow.adapter_key}.adapter:v1`
+  });
+
+  persistRawSnapshot(db, {
+    retailer_key: offerRow.adapter_key,
+    product_offer_id: offerRow.id,
+    product_url: offerRow.product_url,
+    availability_state: state,
+    confidence_score: signalToUse.confidence_score,
+    raw_signal: signalToUse.raw_signal,
+    detected_at: nowIso
+  });
+
+  db.prepare(`
+    UPDATE product_offers
+    SET last_seen_price = ?,
+        current_state = ?,
+        last_seen_at = ?,
+        last_in_stock_at = CASE WHEN ? = ? THEN ? ELSE last_in_stock_at END
+    WHERE id = ?
+  `).run(price, state, nowIso, state, STATES.IN_STOCK, nowIso, offerRow.id);
+
+  const transitioned = shouldAlertTransition(oldState, state);
+  const droppedPrice = shouldAlertPriceDrop(oldPrice, price, 7);
+  const passesConfidence = shouldEmitByConfidence(signalToUse, 0.7);
+  const withinCooldown = isWithinCooldown({
+    db,
+    offerId: offerRow.id,
+    newState: state,
+    cooldownMs: Number(process.env.ALERT_DEDUPE_COOLDOWN_MS || 600000)
+  });
+  const suppressionReasons = [];
+  if (!(transitioned || droppedPrice)) suppressionReasons.push("suppressed_by_transition_rules");
+  if (!passesConfidence) suppressionReasons.push("suppressed_by_confidence");
+  if (withinCooldown) suppressionReasons.push("suppressed_by_cooldown");
+  if (confirmResult.retracted) suppressionReasons.push("suppressed_by_unverified_second_pass");
+
+  const shouldEmitEvent = (transitioned || droppedPrice) && passesConfidence && !withinCooldown;
+  if (shouldEmitEvent) {
+    db.prepare(`
+      INSERT INTO events (product_offer_id, event_type, old_state, new_state, old_price, new_price, raw_snapshot_hash)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      offerRow.id,
+      droppedPrice && !transitioned ? STATES.PRICE_CHANGED : "STATE_CHANGED",
+      oldState,
+      state,
+      oldPrice,
+      price,
+      `${offerRow.adapter_key}:${Date.now()}`
+    );
+
+    const adapterKeyLower = String(offerRow.adapter_key || "").toLowerCase();
+    const productUrlNormalized = normalizeUrlLoose(offerRow.product_url);
+    const targets = db.prepare(`
+      SELECT at.*, u.discord_webhook, u.email, u.email_address, u.phone_number
+      FROM alert_targets at
+      JOIN users u ON u.id = at.user_id
+      WHERE at.active = 1
+    `).all();
+
+    for (const target of targets) {
+      const targetRetailer = String(target.retailer || "").toLowerCase();
+      const retailerMatches = targetRetailer.includes(adapterKeyLower);
+      const urlMatches = normalizeUrlLoose(target.product_url) === productUrlNormalized;
+      const nameMatches = textMatchesAlertName(target.name, title);
+      if (!(retailerMatches && (urlMatches || nameMatches))) continue;
+
+      const prefs = getUserAlertPreferences(target.user_id);
+      const eventPayload = {
+        productName: title,
+        productUrl: offerRow.product_url,
+        newPrice: price,
+        oldState,
+        newState: state,
+        retailer: offerRow.adapter_key,
+        severity: classifyEventSeverity({ oldState, newState: state, oldPrice, newPrice: price })
+      };
+      if (!shouldDeliverBySeverity(prefs.severity, eventPayload.severity)) continue;
+      if (!shouldDeliverByPriceCeiling(prefs.price_ceiling, eventPayload.newPrice)) continue;
+      await deliverAlertTargetNotification(target, target, eventPayload);
+    }
+  }
+
+  if (suppressionReasons.length > 0) {
+    suppressionReasons.forEach((reason) => {
+      recordSuppression(db, {
+        source_key: offerRow.adapter_key,
+        product_offer_id: offerRow.id,
+        product_url: offerRow.product_url,
+        reason,
+        details: { oldState, state, oldPrice, price, confidence: signalToUse.confidence_score }
+      });
+    });
+  }
+
+  if (confirmResult.retracted) {
+    db.prepare(`
+      INSERT INTO events (product_offer_id, event_type, old_state, new_state, old_price, new_price, raw_snapshot_hash)
+      VALUES (?, 'RETRACTED_TENTATIVE', ?, ?, ?, ?, ?)
+    `).run(offerRow.id, oldState, state, oldPrice, price, `${offerRow.adapter_key}:${Date.now()}:retracted`);
+  }
+
+  recordPipelineTrace(db, {
+    source_key: offerRow.adapter_key,
+    product_url: offerRow.product_url,
+    source_hit: { productUrl: offerRow.product_url, nowIso },
+    parse_result: signal,
+    normalization_result: { sourceType, state, price, confidence: signalToUse.confidence_score },
+    dedupe_result: { withinCooldown },
+    state_result: { oldState, newState: state, transitioned, droppedPrice },
+    alert_decision: {
+      emitted: shouldEmitEvent,
+      suppressionReasons
+    },
+    notification_result: { queued: false }
+  });
+
+  return { transitioned, droppedPrice, state, title, price, oldState };
+}
+
+async function runRetailerSourceCycle(adapterKey, options = {}) {
+  const startedAt = new Date().toISOString();
+  const runInsert = db.prepare(`
+    INSERT INTO monitor_runs (adapter_key, started_at, status, requests_made, errors_count)
+    VALUES (?, ?, 'running', 0, 0)
+  `).run(adapterKey, startedAt);
+
+  let requestsMade = 0;
+  let errorsCount = 0;
+  try {
+    const offers = db.prepare(`
+      SELECT po.*, r.adapter_key, p.canonical_name
+      FROM product_offers po
+      JOIN retailers r ON r.id = po.retailer_id
+      JOIN products p ON p.id = po.product_id
+      WHERE r.adapter_key = ?
+      ORDER BY po.id DESC
+      LIMIT ?
+    `).all(adapterKey, Number(options.limit || 150));
+
+    for (const offer of offers) {
+      try {
+        await monitorMajorRetailOffer(offer);
+        requestsMade += 1;
+      } catch (err) {
+        errorsCount += 1;
+        console.error(`${adapterKey} monitor failed for ${offer.product_url}:`, err.message);
+      }
+    }
+
+    db.prepare(`
+      UPDATE monitor_runs
+      SET finished_at = ?, status = 'ok', requests_made = ?, errors_count = ?
+      WHERE id = ?
+    `).run(new Date().toISOString(), requestsMade, errorsCount, runInsert.lastInsertRowid);
+  } catch (err) {
+    db.prepare(`
+      UPDATE monitor_runs
+      SET finished_at = ?, status = 'failed', requests_made = ?, errors_count = ?
+      WHERE id = ?
+    `).run(new Date().toISOString(), requestsMade, errorsCount + 1, runInsert.lastInsertRowid);
+    throw err;
+  }
+}
+
+async function runMajorRetailMonitorCycle() {
+  const startedAt = new Date().toISOString();
+  const runInsert = db.prepare(`
+    INSERT INTO monitor_runs (adapter_key, started_at, status, requests_made, errors_count)
+    VALUES ('major-retail', ?, 'running', 0, 0)
+  `).run(startedAt);
+
+  let requestsMade = 0;
+  let errorsCount = 0;
+  try {
+    for (const key of ["bestbuy", "target", "walmart", "gamestop"]) {
+      await runRetailerSourceCycle(key, { limit: 150 });
+      requestsMade += 1;
+    }
+
+    db.prepare(`
+      UPDATE monitor_runs
+      SET finished_at = ?, status = 'ok', requests_made = ?, errors_count = ?
+      WHERE id = ?
+    `).run(new Date().toISOString(), requestsMade, errorsCount, runInsert.lastInsertRowid);
+  } catch (err) {
+    db.prepare(`
+      UPDATE monitor_runs
+      SET finished_at = ?, status = 'failed', requests_made = ?, errors_count = ?
+      WHERE id = ?
+    `).run(new Date().toISOString(), requestsMade, errorsCount + 1, runInsert.lastInsertRowid);
+    throw err;
+  }
+}
+
+async function runSourceRegistryCycle() {
+  const sources = getAllSources(db).filter((s) => s.enabled);
+  const jobs = sources.map((source) => (async () => {
+    const start = Date.now();
+    if (inFlightSourceRuns.has(source.source_key)) {
+      return { source_key: source.source_key, ok: false, duration_ms: 0, error: "already_running" };
+    }
+    inFlightSourceRuns.add(source.source_key);
+    try {
+      if (source.source_key === "pokemoncenter") {
+        await runPokemonCenterMonitorCycle();
+      } else if (["bestbuy", "target", "walmart", "gamestop"].includes(source.source_key)) {
+        await runRetailerSourceCycle(source.source_key, { limit: 200 });
+      } else if (source.source_type === "secondary_market") {
+        // Market lane in this build is visibility-focused and derived from market snapshots.
+        const latest = db.prepare(`
+          SELECT product_name, source_name, price, url, captured_at
+          FROM market_snapshots
+          ORDER BY captured_at DESC
+          LIMIT 20
+        `).all();
+        latest.forEach((row) => {
+          recordRawSighting(db, {
+            source_key: source.source_key,
+            source_type: "secondary_market",
+            scrape_url: row.url,
+            product_url: row.url,
+            title: row.product_name,
+            seller_name: row.source_name,
+            seller_type: "secondary_market",
+            price: row.price,
+            currency: "USD",
+            availability_state: "LISTED",
+            confidence_score: 0.6,
+            parser_version: "market.snapshot:v1",
+            raw_signal: JSON.stringify(row)
+          });
+        });
+      }
+      return { source_key: source.source_key, ok: true, duration_ms: Date.now() - start };
+    } catch (err) {
+      return { source_key: source.source_key, ok: false, duration_ms: Date.now() - start, error: err.message };
+    } finally {
+      inFlightSourceRuns.delete(source.source_key);
+    }
+  })());
+
+  return Promise.all(jobs);
+}
+
+function formatTimeAgo(date) {
+  const diffMs = Date.now() - date.getTime();
+  const totalMinutes = Math.max(Math.round(diffMs / 60000), 0);
+  if (totalMinutes < 60) return `${totalMinutes} minutes ago`;
+  const totalHours = Math.round(totalMinutes / 60);
+  if (totalHours < 24) return `${totalHours} hours ago`;
+  const totalDays = Math.round(totalHours / 24);
+  return `${totalDays} days ago`;
+}
+
+function normalizeRetailer(value) {
+  return String(value || "").trim().toLowerCase();
+}
+
+function isTargetRetailer(value) {
+  return normalizeRetailer(value).includes("target");
+}
+
+function retailerSearchUrl(retailer, productName) {
+  const normalizedRetailer = normalizeRetailer(retailer);
+  const encodedName = encodeURIComponent(String(productName || "").trim());
+  if (!encodedName) return null;
+
+  if (normalizedRetailer.includes("target")) {
+    return `https://www.target.com/s?searchTerm=${encodedName}`;
+  }
+  if (normalizedRetailer.includes("walmart")) {
+    return `https://www.walmart.com/search?q=${encodedName}`;
+  }
+  if (normalizedRetailer.includes("bestbuy")) {
+    return `https://www.bestbuy.com/site/searchpage.jsp?st=${encodedName}`;
+  }
+  if (normalizedRetailer.includes("gamestop")) {
+    return `https://www.gamestop.com/search/?q=${encodedName}`;
+  }
+  if (normalizedRetailer.includes("pokemon") || normalizedRetailer.includes("pokémon")) {
+    return `https://www.pokemoncenter.com/search/${encodedName}`;
+  }
+  return null;
+}
+
+function retailerToAdapterKey(retailer) {
+  const normalizedRetailer = normalizeRetailer(retailer);
+  if (normalizedRetailer.includes("target")) return "target";
+  if (normalizedRetailer.includes("bestbuy")) return "bestbuy";
+  if (normalizedRetailer.includes("walmart")) return "walmart";
+  if (normalizedRetailer.includes("gamestop")) return "gamestop";
+  if (normalizedRetailer.includes("pokemon") || normalizedRetailer.includes("pokémon")) return "pokemoncenter";
+  return null;
+}
+
+function bestBuySkuUrl(sku) {
+  const clean = String(sku || "").replace(/[^0-9]/g, "");
+  if (!clean) return null;
+  return `https://www.bestbuy.com/site/searchpage.jsp?st=${encodeURIComponent(clean)}`;
+}
+
+function walmartItemUrl(itemId) {
+  const clean = String(itemId || "").replace(/[^0-9]/g, "");
+  if (!clean) return null;
+  return `https://www.walmart.com/ip/${clean}`;
+}
+
+function bootstrapCuratedOffers() {
+  const existingOffers = new Set(db.prepare("SELECT product_url FROM product_offers").all().map((row) => normalizeUrlLoose(row.product_url)));
+  const curatedMatrix = buildCuratedRetailMatrix();
+  for (const rowSpec of curatedMatrix) {
+    const title = `${rowSpec.set_name} ${rowSpec.product_type_label}`;
+    const rows = [
+      {
+        adapter: "pokemoncenter",
+        product_url: rowSpec.pokemoncenter_etb_url || retailerSearchUrl("pokemoncenter", rowSpec.product_query),
+        retailer_sku: null
+      },
+      {
+        adapter: "bestbuy",
+        product_url: rowSpec.bestbuy_sku ? bestBuySkuUrl(rowSpec.bestbuy_sku) : retailerSearchUrl("bestbuy", rowSpec.product_query),
+        retailer_sku: rowSpec.bestbuy_sku || null
+      },
+      {
+        adapter: "walmart",
+        product_url: rowSpec.walmart_item ? walmartItemUrl(rowSpec.walmart_item) : retailerSearchUrl("walmart", rowSpec.product_query),
+        retailer_sku: rowSpec.walmart_item || null
+      },
+      {
+        adapter: "target",
+        product_url: retailerSearchUrl("target", rowSpec.target_query || rowSpec.product_query),
+        retailer_sku: null
+      }
+    ];
+    for (const row of rows) {
+      const normalizedUrl = normalizeUrlLoose(row.product_url);
+      if (!normalizedUrl || existingOffers.has(normalizedUrl)) continue;
+      try {
+        const ensured = ensureProductAndOffer(row.product_url, title, null, STATES.LISTED, row.adapter, { retailerSku: row.retailer_sku });
+        db.prepare("UPDATE products SET set_name = COALESCE(set_name, ?), product_type = COALESCE(product_type, ?) WHERE id = ?")
+          .run(rowSpec.set_name, rowSpec.product_type_label, ensured.product.id);
+        if (row.retailer_sku) {
+          db.prepare("UPDATE product_offers SET retailer_sku = COALESCE(retailer_sku, ?) WHERE id = ?").run(row.retailer_sku, ensured.offer.id);
+        }
+        existingOffers.add(normalizedUrl);
+      } catch (err) {
+        console.error("Curated offer bootstrap failed:", err.message);
+      }
+    }
+  }
+}
+
+function statusLabel(status) {
+  if (status === "in_stock") return "IN STOCK";
+  if (status === "out_of_stock") return "OUT OF STOCK";
+  if (status === "pre_order") return "PRE-ORDER";
+  return "UNKNOWN";
+}
+
+async function sendMarketSnapshot(user) {
+  throw new Error("sendMarketSnapshot is deprecated. Use sendTarget24hUpdate instead.");
+}
+
+function buildTarget24hSummary(userId) {
+  const recentEvents = db.prepare(`
+    SELECT e.created_at, e.event_type, t.name, t.retailer, t.product_url
+    FROM alert_events e
+    JOIN alert_targets t ON t.id = e.alert_target_id
+    WHERE e.user_id = ?
+      AND lower(t.retailer) LIKE '%target%'
+      AND e.created_at >= datetime('now', '-24 hours')
+    ORDER BY e.created_at DESC
+    LIMIT 25
+  `).all(userId);
+
+  const currentInStock = db.prepare(`
+    SELECT id, name, retailer, product_url, last_scan_at
+    FROM alert_targets
+    WHERE user_id = ?
+      AND active = 1
+      AND channel_type = 'discord'
+      AND lower(retailer) LIKE '%target%'
+      AND last_scan_status = 'in_stock'
+    ORDER BY last_scan_at DESC
+  `).all(userId);
+
+  const currentPreOrder = db.prepare(`
+    SELECT id, name, retailer, product_url, last_scan_at
+    FROM alert_targets
+    WHERE user_id = ?
+      AND active = 1
+      AND channel_type = 'discord'
+      AND lower(retailer) LIKE '%target%'
+      AND last_scan_status = 'pre_order'
+    ORDER BY last_scan_at DESC
+  `).all(userId);
+
+  const currentOutOfStock = db.prepare(`
+    SELECT id, name, retailer, product_url, last_scan_at
+    FROM alert_targets
+    WHERE user_id = ?
+      AND active = 1
+      AND channel_type = 'discord'
+      AND lower(retailer) LIKE '%target%'
+      AND last_scan_status = 'out_of_stock'
+    ORDER BY last_scan_at DESC
+  `).all(userId);
+
+  return {
+    recentEvents,
+    currentInStock,
+    currentPreOrder,
+    currentOutOfStock
+  };
+}
+
+async function sendTarget24hUpdate(user) {
+  const webhook = String(user.discord_webhook || "").trim();
+  if (!isValidDiscordWebhookUrl(webhook)) {
+    throw new Error("A valid default Discord webhook is required to send Target updates.");
+  }
+
+  const summary = buildTarget24hSummary(user.id);
+  const eventLines = summary.recentEvents.slice(0, 10).map((event) => {
+    return `- ${event.created_at} | ${statusLabel(event.event_type === "in_stock" ? "in_stock" : "unknown")} | ${event.name} | ${event.product_url}`;
+  });
+
+  const content = [
+    "Target 24-Hour Stock Update",
+    `In-stock detections in last 24 hours: ${summary.recentEvents.length}`,
+    `Currently in stock right now: ${summary.currentInStock.length}`,
+    `Currently pre-order right now: ${summary.currentPreOrder.length}`,
+    `Currently out of stock right now: ${summary.currentOutOfStock.length}`,
+    "",
+    "Recent events:",
+    ...(eventLines.length ? eventLines : ["- No in-stock events logged in last 24 hours"])
+  ].join("\n");
+
+  return postJson(webhook, { content });
+}
+
+async function sendAutomatedTargetUpdates() {
+  const users = db.prepare(`
+    SELECT id, discord_webhook
+    FROM users
+    WHERE discord_webhook IS NOT NULL
+      AND trim(discord_webhook) != ''
+  `).all();
+
+  for (const userRecord of users) {
+    if (!isValidDiscordWebhookUrl(userRecord.discord_webhook)) {
+      continue;
+    }
+
+    try {
+      await sendTarget24hUpdate(userRecord);
+    } catch (err) {
+      console.error(`Automated Target update failed for user ${userRecord.id}:`, err.message);
+    }
+  }
+}
+
+async function runAutomatedScan(userId = null, options = {}) {
+  const targetOnly = options.targetOnly !== false;
+  const targets = db.prepare(`
+    SELECT t.*, u.discord_webhook
+    FROM alert_targets t
+    JOIN users u ON u.id = t.user_id
+    WHERE t.active = 1 AND t.channel_type = 'discord'
+      AND (? IS NULL OR t.user_id = ?)
+    ORDER BY t.id ASC
+  `).all(userId, userId);
+
+  for (const target of targets) {
+    if (targetOnly && !isTargetRetailer(target.retailer)) {
+      continue;
+    }
+
+    const webhook = getDiscordWebhookForTarget(target);
+    const startedAt = new Date().toISOString();
+    const result = await scanAlertTarget(target);
+
+    db.prepare(`
+      UPDATE alert_targets
+      SET last_scan_status = ?, last_scan_at = ?
+      WHERE id = ?
+    `).run(result.status, startedAt, target.id);
+
+    if (result.error) {
+      console.error(`Scan failed for target ${target.id}:`, result.error.message);
+      continue;
+    }
+
+    if (!webhook) continue;
+    if (!isValidDiscordWebhookUrl(webhook)) {
+      console.error(`Skipping invalid Discord webhook for target ${target.id}`);
+      continue;
+    }
+    if (result.status !== "in_stock") continue;
+    if (target.last_scan_status === "in_stock") continue;
+
+    const syntheticTarget = { ...target, channel_value: webhook };
+    await sendDiscordAlert(syntheticTarget, { timeAgo: formatTimeAgo(new Date(startedAt)) });
+
+    db.prepare(`
+      UPDATE alert_targets
+      SET last_alerted_at = ?
+      WHERE id = ?
+    `).run(startedAt, target.id);
+
+    db.prepare(`
+      INSERT INTO alert_events (alert_target_id, user_id, event_type, event_message)
+      VALUES (?, ?, 'in_stock', ?)
+    `).run(target.id, target.user_id, `${target.name} in stock at ${target.retailer}`);
+  }
+}
+
+ensureOwnerSeeded();
+ensureReleasedSetCatalogSeeded();
+
+app.post("/stripe/webhook", express.raw({ type: "application/json" }), (req, res) => {
+  if (!stripe || !process.env.STRIPE_WEBHOOK_SECRET) {
+    return res.status(200).send("Stripe not configured");
+  }
+
+  let event;
+  try {
+    event = stripe.webhooks.constructEvent(req.body, req.headers["stripe-signature"], process.env.STRIPE_WEBHOOK_SECRET);
+  } catch (err) {
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+
+  try {
+    if (event.type === "checkout.session.completed") {
+      const session = event.data.object;
+      const userId = Number(session.metadata?.userId);
+      const planId = session.metadata?.planId;
+      const subscriptionId = session.subscription;
+      const customerId = session.customer;
+
+      if (userId && planId) {
+        db.prepare(`
+          UPDATE users
+          SET stripe_customer_id = ?,
+              stripe_subscription_id = ?,
+              subscription_tier = ?,
+              subscription_status = 'active',
+              alerts_quota = ?
+          WHERE id = ?
+        `).run(customerId || null, subscriptionId || null, planId, quotaForPlan(planId), userId);
+      }
+    }
+
+    if (event.type === "customer.subscription.updated" || event.type === "customer.subscription.deleted") {
+      const sub = event.data.object;
+      const status = sub.status || "canceled";
+      const priceId = sub.items?.data?.[0]?.price?.id || null;
+      const plan = planFromPriceId(priceId);
+      db.prepare(`
+        UPDATE users
+        SET subscription_status = ?,
+            subscription_tier = ?,
+            alerts_quota = ?
+        WHERE stripe_subscription_id = ?
+      `).run(
+        status,
+        status === "active" && plan ? plan.id : "free",
+        status === "active" && plan ? quotaForPlan(plan.id) : quotaForPlan("free"),
+        sub.id
+      );
+    }
+  } catch (err) {
+    console.error("Webhook handler error:", err);
+    return res.status(500).send("Webhook handler failed");
+  }
+
+  res.json({ received: true });
+});
+
+app.use(express.urlencoded({ extended: true }));
+app.use(express.json());
+app.use(cookieParser());
+app.use(helmet({ contentSecurityPolicy: false }));
+
+app.get("/", (req, res) => {
+  const user = ownerOverride(currentUser(req));
+  const body = `
+    <section class="hero">
+      <span class="pill">Pokemon TCG Alerts SaaS Starter</span>
+      <h1>Sell paid alert subscriptions without giving yourself limits.</h1>
+      <p class="muted">This starter includes login, owner seeding, free/basic/pro plans, Stripe Checkout, webhook syncing, and a simple alert-target dashboard.</p>
+      <div style="display:flex; gap:12px; flex-wrap:wrap; margin-top:18px;">
+        <a href="/pricing"><button>See pricing</button></a>
+        ${user ? `<a href="/dashboard"><button>Open dashboard</button></a>` : `<a href="/register"><button>Create account</button></a>`}
+      </div>
+    </section>
+    <section class="grid">
+      <div class="card"><h3>Owner access</h3><p class="muted">Your owner account is seeded automatically from <code>OWNER_EMAIL</code> and <code>OWNER_PASSWORD</code> and always has active pro access.</p></div>
+      <div class="card"><h3>Monetization</h3><p class="muted">Paid users upgrade through Stripe Checkout. Webhooks mark subscriptions active, changed, or canceled in your database.</p></div>
+      <div class="card"><h3>Next step</h3><p class="muted">Wire the existing restock tracker to read the <code>alert_targets</code> table instead of a static config file, then sell access to those alerts.</p></div>
+    </section>
+  `;
+  res.send(renderPage("Pokemon Alerts SaaS", body, user));
+});
+
+app.get("/pricing", (req, res) => {
+  const user = ownerOverride(currentUser(req));
+  const cards = Object.values(PLANS).map(plan => {
+    const features = plan.features.map(x => `<li>${x}</li>`).join("");
+    const cta = plan.id === "free"
+      ? `<a href="${user ? "/dashboard" : "/register"}"><button>${user ? "Current free access" : "Start free"}</button></a>`
+      : user
+        ? `<form method="post" action="/create-checkout-session"><input type="hidden" name="planId" value="${plan.id}" /><button>Subscribe to ${plan.label}</button></form>`
+        : `<a href="/login"><button>Login to subscribe</button></a>`;
+
+    return `<div class="card"><h2>${plan.label}</h2><p>${plan.monthly}</p><ul>${features}</ul>${cta}</div>`;
+  }).join("");
+
+  res.send(renderPage("Pricing", `<div class="grid">${cards}</div>`, user));
+});
+
+app.get("/register", (req, res) => {
+  const user = ownerOverride(currentUser(req));
+  if (user) return res.redirect("/dashboard");
+  const body = `
+    <div class="card">
+      <h1>Create account</h1>
+      <form method="post" action="/register">
+        <label>Email</label><input type="email" name="email" required />
+        <label style="margin-top:12px; display:block;">Password</label><input type="password" name="password" required minlength="8" />
+        <div style="margin-top:16px;"><button>Create account</button></div>
+      </form>
+    </div>`;
+  res.send(renderPage("Register", body, null));
+});
+
+app.post("/register", async (req, res) => {
+  const email = String(req.body.email || "").trim().toLowerCase();
+  const password = String(req.body.password || "");
+  if (!email || password.length < 8) {
+    return res.status(400).send(renderPage("Register", `<div class="card"><p class="danger">Use a valid email and a password with at least 8 characters.</p><a href="/register"><button>Back</button></a></div>`));
+  }
+
+  const existing = db.prepare("SELECT id FROM users WHERE email = ?").get(email);
+  if (existing) {
+    return res.status(400).send(renderPage("Register", `<div class="card"><p class="danger">That email is already registered.</p><a href="/login"><button>Go to login</button></a></div>`));
+  }
+
+  const hash = await bcrypt.hash(password, 10);
+  const result = db.prepare(`
+    INSERT INTO users (email, password_hash, role, subscription_tier, subscription_status, alerts_quota)
+    VALUES (?, ?, 'user', 'free', 'inactive', ?)
+  `).run(email, hash, quotaForPlan("free"));
+
+  const user = getUserById(result.lastInsertRowid);
+  res.cookie("auth_token", signAuthCookie(user), { httpOnly: true, sameSite: "lax", secure: false });
+  return res.redirect("/dashboard");
+});
+
+app.get("/login", (req, res) => {
+  const user = ownerOverride(currentUser(req));
+  if (user) return res.redirect("/dashboard");
+  const body = `
+    <div class="card">
+      <h1>Login</h1>
+      <form method="post" action="/login">
+        <label>Email</label><input type="email" name="email" required />
+        <label style="margin-top:12px; display:block;">Password</label><input type="password" name="password" required />
+        <div style="margin-top:16px;"><button>Login</button></div>
+      </form>
+    </div>`;
+  res.send(renderPage("Login", body, null));
+});
+
+app.post("/login", async (req, res) => {
+  const email = String(req.body.email || "").trim().toLowerCase();
+  const password = String(req.body.password || "");
+  const user = db.prepare("SELECT * FROM users WHERE email = ?").get(email);
+  if (!user) {
+    return res.status(401).send(renderPage("Login", `<div class="card"><p class="danger">Invalid login.</p><a href="/login"><button>Try again</button></a></div>`));
+  }
+  const ok = await bcrypt.compare(password, user.password_hash);
+  if (!ok) {
+    return res.status(401).send(renderPage("Login", `<div class="card"><p class="danger">Invalid login.</p><a href="/login"><button>Try again</button></a></div>`));
+  }
+  res.cookie("auth_token", signAuthCookie(user), { httpOnly: true, sameSite: "lax", secure: false });
+  res.redirect("/dashboard");
+});
+
+app.post("/logout", (req, res) => {
+  res.clearCookie("auth_token");
+  res.redirect("/");
+});
+
+app.get("/dashboard", requireAuth, (req, res) => {
+  const user = ownerOverride(getUserById(req.auth.sub));
+  const prefs = getUserAlertPreferences(user.id);
+  const targets = db.prepare("SELECT * FROM alert_targets WHERE user_id = ? ORDER BY created_at DESC").all(user.id);
+  const targetSummary = buildTarget24hSummary(user.id);
+  const releases = db.prepare(`
+    SELECT id, title, set_name, release_date
+    FROM release_calendar
+    WHERE release_date >= date('now')
+    ORDER BY release_date ASC
+    LIMIT 5
+  `).all();
+  const latestMonitorRuns = db.prepare(`
+    SELECT adapter_key, status, started_at, finished_at, requests_made, errors_count
+    FROM monitor_runs
+    ORDER BY started_at DESC
+    LIMIT 8
+  `).all();
+  const marketRows = db.prepare(`
+    SELECT product_name, source_name, price, url, captured_at
+    FROM market_snapshots
+    ORDER BY captured_at DESC
+    LIMIT 6
+  `).all();
+  const notificationRows = db.prepare(`
+    SELECT channel, status, created_at
+    FROM notification_logs
+    WHERE user_id = ?
+    ORDER BY created_at DESC
+    LIMIT 6
+  `).all(user.id);
+  const ingestionCounts = db.prepare(`
+    SELECT
+      (SELECT COUNT(*) FROM raw_sightings WHERE detected_at >= datetime('now', 'start of day')) AS raw_sightings_today,
+      (SELECT COUNT(*) FROM normalized_offers WHERE updated_at >= datetime('now', 'start of day')) AS normalized_offers_today,
+      (SELECT COUNT(*) FROM events WHERE created_at >= datetime('now', 'start of day')) AS alertable_events_today,
+      (SELECT COUNT(*) FROM suppression_events WHERE created_at >= datetime('now', 'start of day')) AS suppressed_events_today,
+      (SELECT COUNT(*) FROM raw_sightings WHERE source_type IN ('marketplace', 'secondary_market') AND detected_at >= datetime('now', 'start of day')) AS marketplace_offers_today,
+      (SELECT COALESCE(SUM(errors_count), 0) FROM monitor_runs WHERE started_at >= datetime('now', 'start of day')) AS monitor_errors_today
+  `).get();
+  const sourceHealthRows = db.prepare(`
+    SELECT sr.display_name, sr.source_key, sr.source_type, sr.enabled,
+           COALESCE(mr.status, 'unknown') AS status,
+           mr.started_at, mr.finished_at, COALESCE(mr.requests_made, 0) AS requests_made, COALESCE(mr.errors_count, 0) AS errors_count
+    FROM source_registry sr
+    LEFT JOIN monitor_runs mr ON mr.id = (
+      SELECT id FROM monitor_runs m2
+      WHERE m2.adapter_key = sr.source_key
+      ORDER BY started_at DESC
+      LIMIT 1
+    )
+    ORDER BY sr.source_type ASC, sr.source_key ASC
+    LIMIT 12
+  `).all();
+  const remaining = Math.max(user.alerts_quota - targets.length, 0);
+  const flash = String(req.query.flash || "").trim();
+  const message = String(req.query.message || "").trim();
+
+  const flashHtml = flash && message ? `
+    <div class="card">
+      <p class="${flash === "success" ? "success" : "danger"}">${escapeHtml(message)}</p>
+    </div>
+  ` : "";
+
+  const yesterdayCounts = db.prepare(`
+    SELECT
+      (SELECT COUNT(*) FROM raw_sightings WHERE detected_at >= datetime('now', '-1 day', 'start of day') AND detected_at < datetime('now', 'start of day')) AS raw_sightings_yesterday,
+      (SELECT COUNT(*) FROM normalized_offers WHERE updated_at >= datetime('now', '-1 day', 'start of day') AND updated_at < datetime('now', 'start of day')) AS normalized_offers_yesterday,
+      (SELECT COUNT(*) FROM events WHERE created_at >= datetime('now', '-1 day', 'start of day') AND created_at < datetime('now', 'start of day')) AS alertable_events_yesterday,
+      (SELECT COUNT(*) FROM suppression_events WHERE created_at >= datetime('now', '-1 day', 'start of day') AND created_at < datetime('now', 'start of day')) AS suppressed_events_yesterday,
+      (SELECT COUNT(*) FROM raw_sightings WHERE source_type IN ('marketplace', 'secondary_market') AND detected_at >= datetime('now', '-1 day', 'start of day') AND detected_at < datetime('now', 'start of day')) AS marketplace_offers_yesterday,
+      (SELECT COALESCE(SUM(errors_count), 0) FROM monitor_runs WHERE started_at >= datetime('now', '-1 day', 'start of day') AND started_at < datetime('now', 'start of day')) AS monitor_errors_yesterday
+  `).get();
+
+  const buildDelta = (today, yesterday) => {
+    const current = Number(today || 0);
+    const prev = Number(yesterday || 0);
+    const diff = current - prev;
+    const dir = diff > 0 ? "up" : diff < 0 ? "down" : "flat";
+    const sign = diff > 0 ? "+" : "";
+    return {
+      dir,
+      text: `${sign}${diff} vs yesterday`
+    };
+  };
+
+  const todayKpis = [
+    { label: "Raw sightings", today: ingestionCounts.raw_sightings_today, yesterday: yesterdayCounts.raw_sightings_yesterday, status: "ok" },
+    { label: "Normalized offers", today: ingestionCounts.normalized_offers_today, yesterday: yesterdayCounts.normalized_offers_yesterday, status: "ok" },
+    { label: "Alertable events", today: ingestionCounts.alertable_events_today, yesterday: yesterdayCounts.alertable_events_yesterday, status: "ok" },
+    { label: "Suppressed", today: ingestionCounts.suppressed_events_today, yesterday: yesterdayCounts.suppressed_events_yesterday, status: "warn" },
+    { label: "Marketplace", today: ingestionCounts.marketplace_offers_today, yesterday: yesterdayCounts.marketplace_offers_yesterday, status: "warn" },
+    { label: "Errors", today: ingestionCounts.monitor_errors_today, yesterday: yesterdayCounts.monitor_errors_yesterday, status: ingestionCounts.monitor_errors_today > 0 ? "bad" : "ok" }
+  ];
+
+  const kpiHtml = todayKpis.map((item) => {
+    const delta = buildDelta(item.today, item.yesterday);
+    const statusText = item.status === "bad" ? "Needs attention" : item.status === "warn" ? "Watch" : "Healthy";
+    return `
+      <div class="kpi">
+        <div class="muted">${item.label}</div>
+        <div class="num">${Number(item.today || 0)}</div>
+        <div class="kpi-meta">
+          <span class="delta-${delta.dir}">${delta.text}</span>
+          <span class="status-chip status-${item.status}"><span class="status-dot"></span>${statusText}</span>
+        </div>
+      </div>
+    `;
+  }).join("");
+
+  const sourceTableRows = sourceHealthRows.map((row) => {
+    const started = row.started_at ? new Date(row.started_at) : null;
+    const finished = row.finished_at ? new Date(row.finished_at) : null;
+    const runMs = started && finished ? Math.max(finished.getTime() - started.getTime(), 0) : null;
+    const avgLatency = runMs && row.requests_made ? Math.round(runMs / Math.max(row.requests_made, 1)) : null;
+    const successRate = row.requests_made > 0
+      ? Math.max(0, ((row.requests_made - row.errors_count) / row.requests_made) * 100)
+      : (row.errors_count > 0 ? 0 : 100);
+    const statusClass = row.status === "ok" ? "ok" : row.errors_count > 0 ? "warn" : "bad";
+    return `
+      <tr>
+        <td>${escapeHtml(row.display_name)}</td>
+        <td>${escapeHtml(row.source_type)}</td>
+        <td><span class="status-chip status-${statusClass}"><span class="status-dot"></span>${escapeHtml(row.status)}</span></td>
+        <td>${started ? escapeHtml(formatTimeAgo(started)) : "No runs"}</td>
+        <td>${avgLatency != null ? `${avgLatency} ms` : "N/A"}</td>
+        <td>${successRate.toFixed(1)}%</td>
+        <td>${row.errors_count}</td>
+        <td>
+          <form method="post" action="/sources/run"><button type="submit">Run now</button></form>
+        </td>
+      </tr>
+    `;
+  }).join("");
+
+  const timelineEvents = [
+    ...targetSummary.recentEvents.slice(0, 5).map((event) => ({
+      time: event.created_at,
+      message: `${event.name} restock detected`,
+      detail: event.product_url || "Target lane"
+    })),
+    ...notificationRows.slice(0, 4).map((row) => ({
+      time: row.created_at,
+      message: `${row.channel.toUpperCase()} notification ${row.status}`,
+      detail: "Delivery pipeline"
+    })),
+    ...latestMonitorRuns.slice(0, 4).map((run) => ({
+      time: run.started_at,
+      message: `${run.adapter_key} monitor ${run.status}`,
+      detail: `req:${run.requests_made} err:${run.errors_count}`
+    }))
+  ]
+    .filter((row) => row.time)
+    .sort((a, b) => new Date(b.time).getTime() - new Date(a.time).getTime())
+    .slice(0, 10);
+
+  const timelineHtml = timelineEvents.length
+    ? timelineEvents.map((item) => `
+      <li>
+        <div class="when">${escapeHtml(formatTimeAgo(new Date(item.time)))}</div>
+        <div>${escapeHtml(item.message)}</div>
+        <div class="mini">${escapeHtml(item.detail)}</div>
+      </li>
+    `).join("")
+    : `<li><div class="muted">No recent activity yet.</div></li>`;
+
+  const rows = targets.length ? targets.map(t => `
+    <tr>
+      <td>${t.name}</td>
+      <td>${t.retailer}</td>
+      <td><a href="${t.product_url}" target="_blank" rel="noopener noreferrer">Open</a></td>
+      <td>${t.channel_type}</td>
+      <td><span class="status-chip ${t.active ? "status-ok" : "status-warn"}"><span class="status-dot"></span>${t.active ? "Active" : "Paused"}</span></td>
+      <td>${t.last_scan_status || "unknown"}</td>
+      <td>
+        <form method="post" action="/alerts/${t.id}/test" style="margin-bottom:8px;">
+          <button>Send Test Alert</button>
+        </form>
+        <form method="post" action="/alerts/${t.id}/delete" onsubmit="return confirm('Delete this alert target?')">
+          <button>Delete</button>
+        </form>
+        <form method="post" action="/alerts/${t.id}/find-link" style="margin-top:8px;">
+          <button>Find store link</button>
+        </form>
+      </td>
+    </tr>`).join("")
+  : `<tr><td colspan="7" class="muted">No alert targets yet.</td></tr>`;
+
+  const body = `
+    ${flashHtml}
+    <section class="utility-bar">
+      <input type="text" placeholder="Search alerts, stores, products..." />
+      <select><option>All stores</option><option>Target</option><option>Pokémon Center</option><option>Best Buy</option></select>
+      <select><option>All statuses</option><option>Active</option><option>Paused</option><option>Warning</option></select>
+      <div class="status-chip status-ok"><span class="status-dot"></span>Last updated ${latestMonitorRuns[0]?.started_at ? escapeHtml(formatTimeAgo(new Date(latestMonitorRuns[0].started_at))) : "just now"}</div>
+      <form method="post" action="/sources/run"><button type="submit">Refresh</button></form>
+      <form method="post" action="/catalog/import-target-searches"><button type="submit">Create alert set</button></form>
+    </section>
+    <div class="ticker">
+      ${timelineEvents.slice(0, 6).map((item) => `<span class="ticker-item">● ${escapeHtml(item.message)}</span>`).join("") || `<span class="ticker-item">● Waiting for first events…</span>`}
+    </div>
+    <section class="hero-split">
+      <div class="card hero">
+        <span class="pill">Control Center</span>
+        <h2 style="font-size:32px; margin:10px 0 8px;">Never miss a Pokémon drop</h2>
+        <p class="muted">Monitor ${sourceHealthRows.filter((row) => row.enabled).length} live sources across official + market lanes. Next scheduled run: every 5 minutes.</p>
+        <div style="display:flex; gap:10px; flex-wrap: wrap; margin-top:12px;">
+          <form method="post" action="/catalog/import-target-searches"><button>Create alert set</button></form>
+          <form method="post" action="/sources/run"><button type="submit">Run monitors now</button></form>
+          <form method="post" action="/alerts/target/send-update"><button type="submit">Test notification</button></form>
+        </div>
+        <div style="display:grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap:10px; margin-top:14px;">
+          <div><div class="mini">Active targets</div><strong>${targets.length}</strong></div>
+          <div><div class="mini">Last alert fired</div><strong>${timelineEvents[0]?.time ? escapeHtml(formatTimeAgo(new Date(timelineEvents[0].time))) : "No alerts"}</strong></div>
+          <div><div class="mini">Upcoming releases</div><strong>${releases.length}</strong></div>
+        </div>
+      </div>
+      <div class="card">
+        <h3 style="margin-top:0;">Live system status</h3>
+        <p><strong>Active alerts:</strong> ${targets.length}</p>
+        <p><strong>Stores online:</strong> ${sourceHealthRows.filter((row) => row.enabled).length}</p>
+        <p><strong>Notifications today:</strong> ${notificationRows.length}</p>
+        <p><strong>Monitor errors:</strong> ${ingestionCounts.monitor_errors_today || 0}</p>
+        <div class="mini" style="margin-top:8px;">Scan coverage</div>
+        <div class="progress"><span style="width:${Math.min(100, ((sourceHealthRows.filter((r) => r.enabled).length / Math.max(sourceHealthRows.length, 1)) * 100).toFixed(1))}%;"></span></div>
+      </div>
+    </section>
+    <section class="kpi-row">
+      ${kpiHtml}
+    </section>
+    <div class="panel-frame">
+      <div class="panel-title">
+        <h2 style="margin:0;">Actions & Management</h2>
+        <span class="status-chip status-ok"><span class="status-dot"></span>Operational</span>
+      </div>
+      <div class="grid-12">
+        <div class="col-7">
+      <div class="card">
+        <h2>Plan & Usage</h2>
+        <p><strong>${user.email}</strong> · <span class="pill">${user.role}</span></p>
+        <p>Current plan: <span class="pill">${user.subscription_tier}</span> · <span class="pill">${user.subscription_status}</span></p>
+        <p>Alerts used: ${targets.length}/${user.alerts_quota}</p>
+        <div class="progress"><span style="width:${Math.min(100, (targets.length / Math.max(user.alerts_quota, 1)) * 100)}%;"></span></div>
+        <p class="mini" style="margin-top:8px;">Quota remaining: ${remaining}</p>
+        <a href="/pricing"><button>Manage billing</button></a>
+      </div>
+      <div class="card">
+        <h2>Target drop tools</h2>
+        <p class="muted">Current implementation is Target-only: scan now, track current Target drops, and send a 24-hour recap.</p>
+        <form method="post" action="/settings/discord-webhook">
+          <label>Default Discord webhook</label>
+          <input name="discord_webhook" type="url" placeholder="https://discord.com/api/webhooks/..." value="${escapeHtml(user.discord_webhook || "")}" />
+          <label style="margin-top:12px; display:block;">Alert email (optional)</label>
+          <input name="email_address" type="email" placeholder="you@example.com" value="${escapeHtml(user.email_address || user.email || "")}" />
+          <label style="margin-top:12px; display:block;">Alert phone (optional)</label>
+          <input name="phone_number" placeholder="+15555550123" value="${escapeHtml(user.phone_number || "")}" />
+          <div style="margin-top:16px;"><button>Save default webhook</button></div>
+        </form>
+        <form method="post" action="/alerts/target/scan-now" style="margin-top:12px;">
+          <button>Scan Target drops now</button>
+        </form>
+        <form method="post" action="/alerts/target/send-update" style="margin-top:12px;">
+          <button>Send Target 24h update to Discord</button>
+        </form>
+      </div>
+      <div class="card">
+        <h2>Pokémon Center MVP tools</h2>
+        <p class="muted">Phase 1 runtime: discovery + monitor + digest.</p>
+        <form method="post" action="/pokemoncenter/discovery/run">
+          <button>Run Pokémon Center discovery</button>
+        </form>
+        <form method="post" action="/pokemoncenter/monitor/run" style="margin-top:12px;">
+          <button>Run Pokémon Center monitor</button>
+        </form>
+        <form method="post" action="/pokemoncenter/digest/send" style="margin-top:12px;">
+          <button>Send Pokémon Center 6h digest now</button>
+        </form>
+      </div>
+      <div class="card">
+        <h2>Major retail (Phase 2) tools</h2>
+        <p class="muted">Monitor Best Buy, Target, Walmart, and GameStop offers using adapter-aware checks.</p>
+        <form method="post" action="/retail/monitor/run">
+          <button>Run major retail monitor</button>
+        </form>
+        <form method="post" action="/retail/offers/add" style="margin-top:12px;">
+          <label>Retailer</label>
+          <select name="retailer_key">
+            <option value="bestbuy">Best Buy</option>
+            <option value="target">Target</option>
+            <option value="walmart">Walmart</option>
+            <option value="gamestop">GameStop</option>
+          </select>
+          <label style="margin-top:12px; display:block;">Product name</label>
+          <input name="name" required placeholder="Surging Sparks ETB" />
+          <label style="margin-top:12px; display:block;">Product URL</label>
+          <input name="product_url" required type="url" placeholder="https://..." />
+          <label style="margin-top:12px; display:block;">Retailer SKU (Best Buy optional)</label>
+          <input name="retailer_sku" placeholder="1234567" />
+          <div style="margin-top:12px;"><button>Add retail offer</button></div>
+        </form>
+      </div>
+      <div class="card">
+        <h2>Catalog search seeding</h2>
+        <p class="muted">Includes the last 10 released sets with ETBs, booster bundles, sleeved packs, booster boxes, blisters, tins, and collection boxes.</p>
+        <ul>
+          ${LAST_10_RELEASED_SETS.slice(0, 10).map((set) => `<li>${escapeHtml(set.release_date)} — ${escapeHtml(set.name)}</li>`).join("")}
+        </ul>
+        <form method="post" action="/catalog/import-target-searches" style="margin-top:12px;">
+          <button>Import Target search targets for last 10 sets</button>
+        </form>
+        <form method="post" action="/catalog/import-sample-target-offers" style="margin-top:10px;">
+          <button>Import sample Target product links</button>
+        </form>
+        <form method="post" action="/catalog/import-curated-release-pack" style="margin-top:10px;">
+          <button>Import curated multi-retailer release pack</button>
+        </form>
+        <a href="/catalog/matrix"><button style="margin-top:10px;">Open condensed set matrix</button></a>
+      </div>
+      <div class="card">
+        <h2>Add alert target</h2>
+        <form method="post" action="/alerts">
+          <label>Name</label><input name="name" required placeholder="Journey Together ETB" />
+          <label style="margin-top:12px; display:block;">Retailer</label><input name="retailer" required placeholder="Target" />
+          <label style="margin-top:12px; display:block;">Product URL</label><input name="product_url" type="url" placeholder="Optional. Auto-built from Name + Retailer for Target only." />
+          <label style="margin-top:12px; display:block;">Channel type</label>
+          <select name="channel_type">
+            <option value="discord">Discord webhook</option>
+            <option value="email">Email placeholder</option>
+          </select>
+          <label style="margin-top:12px; display:block;">Channel value</label><input name="channel_value" placeholder="Optional for Discord if default webhook is set" />
+          <div style="margin-top:16px;"><button>Add target</button></div>
+        </form>
+      </div>
+      <div class="card">
+        <h2>Alert preferences</h2>
+        <form method="post" action="/settings/alert-preferences">
+          <label>Severity</label>
+          <select name="severity">
+            <option value="all" ${prefs.severity === "all" ? "selected" : ""}>All alerts</option>
+            <option value="high" ${prefs.severity === "high" ? "selected" : ""}>High only</option>
+            <option value="medium" ${prefs.severity === "medium" ? "selected" : ""}>Medium+</option>
+          </select>
+          <label style="margin-top:12px; display:block;">Price ceiling (optional)</label>
+          <input name="price_ceiling" type="number" step="0.01" value="${prefs.price_ceiling ?? ""}" />
+          <label style="margin-top:12px; display:block;"><input type="checkbox" name="discord_enabled" ${prefs.discord_enabled ? "checked" : ""}/> Discord</label>
+          <label style="margin-top:6px; display:block;"><input type="checkbox" name="email_enabled" ${prefs.email_enabled ? "checked" : ""}/> Email</label>
+          <label style="margin-top:6px; display:block;"><input type="checkbox" name="sms_enabled" ${prefs.sms_enabled ? "checked" : ""}/> SMS</label>
+          <div style="margin-top:12px;"><button>Save preferences</button></div>
+        </form>
+      </div>
+        </div>
+        <div class="col-5">
+          <div class="card">
+            <h2>Source Health Matrix</h2>
+            <p class="muted">Operational monitor table with latency + success rates.</p>
+            <table class="ops-table">
+              <thead><tr><th>Source</th><th>Type</th><th>Status</th><th>Last check</th><th>Avg latency</th><th>Success</th><th>Err</th><th>Action</th></tr></thead>
+              <tbody>${sourceTableRows || `<tr><td colspan="8" class="muted">No source health rows yet.</td></tr>`}</tbody>
+            </table>
+          </div>
+          <div class="card">
+            <h2>Recent Activity</h2>
+            <ul class="timeline">${timelineHtml}</ul>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="panel-frame">
+      <div class="panel-title">
+        <h2 style="margin:0;">Alerts Manager</h2>
+        <form method="post" action="/alerts/target/scan-now"><button type="submit">Run alert scan</button></form>
+      </div>
+      <div class="table-toolbar">
+        <input type="text" placeholder="Search alert name or product..." />
+        <select><option>All statuses</option><option>Active</option><option>Paused</option></select>
+        <select><option>All stores</option><option>Target</option><option>Best Buy</option><option>Walmart</option><option>GameStop</option></select>
+        <form method="post" action="/sources/run"><button type="submit">Bulk resume monitors</button></form>
+      </div>
+      <table>
+        <thead><tr><th>Alert</th><th>Store</th><th>Target</th><th>Channel</th><th>Status</th><th>Last trigger</th><th>Actions</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+    </div>
+
+    <div class="split-pane">
+      <div class="card">
+        <h2>Target update (last 24 hours + right now)</h2>
+        <p><strong>In-stock detections (24h):</strong> ${targetSummary.recentEvents.length}</p>
+        <p><strong>Current Target drops in stock right now:</strong> ${targetSummary.currentInStock.length}</p>
+        <p><strong>Current Target drops in pre-order right now:</strong> ${targetSummary.currentPreOrder.length}</p>
+        <p><strong>Current Target drops out of stock right now:</strong> ${targetSummary.currentOutOfStock.length}</p>
+        <ul>
+          ${targetSummary.recentEvents.length
+            ? targetSummary.recentEvents.slice(0, 8).map((event) => `<li>${escapeHtml(event.created_at)} — ${escapeHtml(event.name)} — <a href="${event.product_url}" target="_blank" rel="noopener noreferrer">Open</a></li>`).join("")
+            : "<li class=\"muted\">No Target in-stock events recorded in the last 24 hours yet.</li>"}
+        </ul>
+      </div>
+      <div class="card">
+        <h2>Release calendar</h2>
+        <p class="muted">Upcoming launches.</p>
+        <ul>
+          ${releases.length
+            ? releases.map((item) => `<li>${escapeHtml(item.release_date)} — ${escapeHtml(item.title)}${item.set_name ? ` (${escapeHtml(item.set_name)})` : ""}</li>`).join("")
+            : "<li class=\"muted\">No upcoming releases yet.</li>"}
+        </ul>
+        <a href="/calendar"><button>Open calendar</button></a>
+      </div>
+    </div>
+    <div class="grid">
+      <div class="card">
+        <h2>Health dashboard</h2>
+        <p class="muted">Latest monitor runs.</p>
+        <ul>
+          ${latestMonitorRuns.length
+            ? latestMonitorRuns.map((run) => `<li>${escapeHtml(run.adapter_key)} — ${escapeHtml(run.status)} — req:${run.requests_made} err:${run.errors_count}</li>`).join("")
+            : "<li class=\"muted\">No monitor runs yet.</li>"}
+        </ul>
+        <a href="/health/dashboard"><button>Open health dashboard</button></a>
+      </div>
+      <div class="card">
+        <h2>Market watch (Phase 4)</h2>
+        <p class="muted">Optional market-price lane, separated from live retail alerts.</p>
+        <ul>
+          ${marketRows.length
+            ? marketRows.map((row) => `<li>${escapeHtml(row.product_name)} — ${escapeHtml(row.source_name)} — ${row.price == null ? "N/A" : `$${Number(row.price).toFixed(2)}`}</li>`).join("")
+            : "<li class=\"muted\">No market snapshots yet.</li>"}
+        </ul>
+        <p class="muted" style="margin-top:12px;">Recent notification activity</p>
+        <ul>
+          ${notificationRows.length
+            ? notificationRows.map((row) => `<li>${escapeHtml(row.channel)} — ${escapeHtml(row.status)} — ${escapeHtml(row.created_at)}</li>`).join("")
+            : "<li class=\"muted\">No notifications logged yet.</li>"}
+        </ul>
+        ${user.role === "owner" ? `
+          <form method="post" action="/market/snapshot" style="margin-top:12px;">
+            <label>Product</label><input name="product_name" required placeholder="Prismatic Evolutions ETB" />
+            <label style="margin-top:8px; display:block;">Source</label><input name="source_name" required placeholder="TCGPlayer" />
+            <label style="margin-top:8px; display:block;">Price</label><input name="price" type="number" step="0.01" />
+            <label style="margin-top:8px; display:block;">URL</label><input name="url" type="url" />
+            <div style="margin-top:10px;"><button>Save market snapshot</button></div>
+          </form>
+        ` : ""}
+      </div>
+    </div>
+  `;
+  res.send(renderPage("Dashboard", body, user));
+});
+
+app.post("/alerts", requireAuth, (req, res) => {
+  const user = ownerOverride(getUserById(req.auth.sub));
+  const count = db.prepare("SELECT COUNT(*) AS c FROM alert_targets WHERE user_id = ?").get(user.id).c;
+  if (count >= user.alerts_quota) {
+    return res.status(400).send(renderPage("Quota reached", `<div class="card"><p class="danger">You have reached your alert quota for the ${user.subscription_tier} plan.</p><a href="/pricing"><button>Upgrade plan</button></a></div>`, user));
+  }
+
+  const payload = {
+    name: String(req.body.name || "").trim(),
+    retailer: String(req.body.retailer || "").trim(),
+    product_url: String(req.body.product_url || "").trim(),
+    channel_type: String(req.body.channel_type || "discord").trim(),
+    channel_value: String(req.body.channel_value || "").trim()
+  };
+
+  const fallbackWebhook = String(user.discord_webhook || "").trim();
+  if (!payload.name || !payload.retailer) {
+    return res.status(400).send(renderPage("Invalid target", `<div class="card"><p class="danger">Fill in every field.</p><a href="/dashboard"><button>Back</button></a></div>`, user));
+  }
+  if (!payload.product_url) {
+    payload.product_url = retailerSearchUrl(payload.retailer, payload.name) || "";
+  }
+  if (!payload.product_url) {
+    return res.status(400).send(renderPage("Invalid target", `<div class="card"><p class="danger">Add a product URL, or use retailer Target for auto-linking.</p><a href="/dashboard"><button>Back</button></a></div>`, user));
+  }
+  if (payload.channel_type === "discord" && !payload.channel_value && !fallbackWebhook) {
+    return res.status(400).send(renderPage("Invalid target", `<div class="card"><p class="danger">Add a channel value or set a default Discord webhook first.</p><a href="/dashboard"><button>Back</button></a></div>`, user));
+  }
+  const finalChannelValue = payload.channel_type === "discord" && !payload.channel_value
+    ? fallbackWebhook
+    : payload.channel_value;
+  if (payload.channel_type === "discord" && !isValidDiscordWebhookUrl(finalChannelValue)) {
+    return res.status(400).send(renderPage("Invalid target", `<div class="card"><p class="danger">Use a valid Discord webhook URL.</p><a href="/dashboard"><button>Back</button></a></div>`, user));
+  }
+
+  db.prepare(`
+    INSERT INTO alert_targets (user_id, name, retailer, product_url, channel_type, channel_value, active)
+    VALUES (?, ?, ?, ?, ?, ?, 1)
+  `).run(user.id, payload.name, payload.retailer, payload.product_url, payload.channel_type, finalChannelValue);
+
+  const adapterKey = retailerToAdapterKey(payload.retailer);
+  if (adapterKey) {
+    try {
+      ensureProductAndOffer(payload.product_url, payload.name, null, STATES.LISTED, adapterKey);
+    } catch (err) {
+      console.error(`Offer bootstrap failed for alert target (${adapterKey}):`, err.message);
+    }
+  }
+
+  res.redirect("/dashboard");
+});
+
+app.post("/alerts/:id/find-link", requireAuth, (req, res) => {
+  const user = ownerOverride(getUserById(req.auth.sub));
+  const alertId = Number(req.params.id);
+  const target = db.prepare("SELECT * FROM alert_targets WHERE id = ? AND user_id = ?").get(alertId, user.id);
+
+  if (!target) {
+    return res.redirect("/dashboard?flash=error&message=Alert%20target%20not%20found");
+  }
+
+  const guessedUrl = retailerSearchUrl(target.retailer, target.name);
+  if (!guessedUrl) {
+    return res.redirect("/dashboard?flash=error&message=Could%20not%20auto-build%20a%20store%20link%20for%20this%20retailer");
+  }
+
+  db.prepare("UPDATE alert_targets SET product_url = ? WHERE id = ? AND user_id = ?").run(guessedUrl, alertId, user.id);
+  return res.redirect("/dashboard?flash=success&message=Store%20search%20link%20updated");
+});
+
+app.post("/settings/discord-webhook", requireAuth, (req, res) => {
+  const user = ownerOverride(getUserById(req.auth.sub));
+  const webhook = String(req.body.discord_webhook || "").trim();
+  const emailAddress = String(req.body.email_address || "").trim().toLowerCase();
+  const phoneNumber = String(req.body.phone_number || "").trim();
+  if (webhook && !isValidDiscordWebhookUrl(webhook)) {
+    return res.redirect("/dashboard?flash=error&message=Please%20enter%20a%20valid%20Discord%20webhook%20URL");
+  }
+  db.prepare("UPDATE users SET discord_webhook = ?, email_address = ?, phone_number = ? WHERE id = ?")
+    .run(webhook || null, emailAddress || null, phoneNumber || null, user.id);
+  res.redirect("/dashboard?flash=success&message=Default%20Discord%20webhook%20saved");
+});
+
+app.post("/settings/alert-preferences", requireAuth, (req, res) => {
+  const user = ownerOverride(getUserById(req.auth.sub));
+  const severity = String(req.body.severity || "all").trim().toLowerCase();
+  const allowedSeverity = ["all", "high", "medium"];
+  const priceCeilingRaw = String(req.body.price_ceiling || "").trim();
+  const priceCeiling = priceCeilingRaw ? Number(priceCeilingRaw) : null;
+  const discordEnabled = req.body.discord_enabled ? 1 : 0;
+  const emailEnabled = req.body.email_enabled ? 1 : 0;
+  const smsEnabled = req.body.sms_enabled ? 1 : 0;
+
+  db.prepare(`
+    INSERT INTO user_alert_preferences (user_id, discord_enabled, email_enabled, sms_enabled, severity, retailer_scope_json, price_ceiling, updated_at)
+    VALUES (?, ?, ?, ?, ?, '[]', ?, ?)
+    ON CONFLICT(user_id) DO UPDATE SET
+      discord_enabled = excluded.discord_enabled,
+      email_enabled = excluded.email_enabled,
+      sms_enabled = excluded.sms_enabled,
+      severity = excluded.severity,
+      price_ceiling = excluded.price_ceiling,
+      updated_at = excluded.updated_at
+  `).run(
+    user.id,
+    discordEnabled,
+    emailEnabled,
+    smsEnabled,
+    allowedSeverity.includes(severity) ? severity : "all",
+    Number.isFinite(priceCeiling) ? priceCeiling : null,
+    new Date().toISOString()
+  );
+
+  return res.redirect("/dashboard?flash=success&message=Alert%20preferences%20saved");
+});
+
+app.post("/catalog/import-target-searches", requireAuth, (req, res) => {
+  const user = ownerOverride(getUserById(req.auth.sub));
+  const existing = new Set(
+    db.prepare("SELECT name FROM alert_targets WHERE user_id = ? AND lower(retailer) LIKE '%target%'").all(user.id).map((row) => row.name)
+  );
+  const queries = buildCatalogQueries();
+  const insert = db.prepare(`
+    INSERT INTO alert_targets (user_id, name, retailer, product_url, channel_type, channel_value, active)
+    VALUES (?, ?, 'Target', ?, 'discord', ?, 1)
+  `);
+
+  const defaultWebhook = String(user.discord_webhook || "").trim();
+  let added = 0;
+  for (const item of queries) {
+    if (existing.has(item.query)) continue;
+    const url = retailerSearchUrl("target", item.query);
+    if (!url) continue;
+    insert.run(user.id, item.query, url, defaultWebhook || "");
+    added += 1;
+  }
+  return res.redirect(`/dashboard?flash=success&message=Imported%20${added}%20Target%20search%20targets`);
+});
+
+app.post("/catalog/import-sample-target-offers", requireAuth, (req, res) => {
+  try {
+    let added = 0;
+    for (const url of SAMPLE_TARGET_URLS) {
+      try {
+        ensureProductAndOffer(url, "Target Pokemon TCG Listing", null, STATES.LISTED, "target");
+        added += 1;
+      } catch {
+        // no-op for duplicates
+      }
+    }
+    return res.redirect(`/dashboard?flash=success&message=Imported%20${added}%20sample%20Target%20offers`);
+  } catch (err) {
+    return res.redirect("/dashboard?flash=error&message=Sample%20Target%20offer%20import%20failed");
+  }
+});
+
+app.post("/catalog/import-curated-release-pack", requireAuth, (req, res) => {
+  const user = ownerOverride(getUserById(req.auth.sub));
+  const defaultWebhook = String(user.discord_webhook || "").trim();
+  let offersAdded = 0;
+  let alertsAdded = 0;
+
+  const existingOffers = new Set(db.prepare("SELECT product_url FROM product_offers").all().map((row) => normalizeUrlLoose(row.product_url)));
+  const existingAlerts = new Set(
+    db.prepare("SELECT retailer, product_url FROM alert_targets WHERE user_id = ?").all(user.id)
+      .map((row) => `${normalizeRetailer(row.retailer)}|${normalizeUrlLoose(row.product_url)}`)
+  );
+
+  const curatedMatrix = buildCuratedRetailMatrix();
+  for (const rowSpec of curatedMatrix) {
+    const title = `${rowSpec.set_name} ${rowSpec.product_type_label}`;
+    const records = [
+      {
+        name: title,
+        set_name: rowSpec.set_name,
+        product_type: rowSpec.product_type_label,
+        retailer: "Pokemon Center",
+        adapter: "pokemoncenter",
+        product_url: rowSpec.pokemoncenter_etb_url || retailerSearchUrl("pokemoncenter", rowSpec.product_query),
+        retailer_sku: null
+      },
+      {
+        name: title,
+        set_name: rowSpec.set_name,
+        product_type: rowSpec.product_type_label,
+        retailer: "Best Buy",
+        adapter: "bestbuy",
+        product_url: rowSpec.bestbuy_sku ? bestBuySkuUrl(rowSpec.bestbuy_sku) : retailerSearchUrl("bestbuy", rowSpec.product_query),
+        retailer_sku: rowSpec.bestbuy_sku || null
+      },
+      {
+        name: title,
+        set_name: rowSpec.set_name,
+        product_type: rowSpec.product_type_label,
+        retailer: "Walmart",
+        adapter: "walmart",
+        product_url: rowSpec.walmart_item ? walmartItemUrl(rowSpec.walmart_item) : retailerSearchUrl("walmart", rowSpec.product_query),
+        retailer_sku: rowSpec.walmart_item || null
+      },
+      {
+        name: title,
+        set_name: rowSpec.set_name,
+        product_type: rowSpec.product_type_label,
+        retailer: "Target",
+        adapter: "target",
+        product_url: retailerSearchUrl("target", rowSpec.target_query || rowSpec.product_query),
+        retailer_sku: null
+      }
+    ].filter((row) => row.product_url);
+
+    for (const row of records) {
+      const normalizedUrl = normalizeUrlLoose(row.product_url);
+      if (!existingOffers.has(normalizedUrl)) {
+        try {
+          const ensured = ensureProductAndOffer(row.product_url, row.name, null, STATES.LISTED, row.adapter, { retailerSku: row.retailer_sku });
+          db.prepare("UPDATE products SET set_name = COALESCE(set_name, ?), product_type = COALESCE(product_type, ?) WHERE id = ?")
+            .run(row.set_name, row.product_type, ensured.product.id);
+          if (row.retailer_sku) {
+            db.prepare("UPDATE product_offers SET retailer_sku = COALESCE(retailer_sku, ?) WHERE id = ?").run(row.retailer_sku, ensured.offer.id);
+          }
+          existingOffers.add(normalizedUrl);
+          offersAdded += 1;
+        } catch (err) {
+          console.error(`Curated offer import failed for ${row.retailer} ${row.name}:`, err.message);
+        }
+      }
+
+      const alertKey = `${normalizeRetailer(row.retailer)}|${normalizedUrl}`;
+      if (!existingAlerts.has(alertKey)) {
+        db.prepare(`
+          INSERT INTO alert_targets (user_id, name, retailer, product_url, channel_type, channel_value, active)
+          VALUES (?, ?, ?, ?, 'discord', ?, 1)
+        `).run(user.id, row.name, row.retailer, row.product_url, defaultWebhook);
+        existingAlerts.add(alertKey);
+        alertsAdded += 1;
+      }
+    }
+  }
+
+  return res.redirect(`/dashboard?flash=success&message=Imported%20${offersAdded}%20offers%20and%20${alertsAdded}%20alerts%20from%20curated%20release%20pack`);
+});
+
+app.post("/alerts/target/scan-now", requireAuth, async (req, res) => {
+  const user = ownerOverride(getUserById(req.auth.sub));
+  try {
+    await runAutomatedScan(user.id, { targetOnly: true });
+    return res.redirect("/dashboard?flash=success&message=Target%20scan%20completed.%20Check%20the%2024h%20update%20card%20below.");
+  } catch (err) {
+    console.error("Manual scan failed:", err);
+    return res.redirect("/dashboard?flash=error&message=Target%20scan%20failed");
+  }
+});
+
+app.post("/alerts/target/send-update", requireAuth, async (req, res) => {
+  const user = ownerOverride(getUserById(req.auth.sub));
+  try {
+    await sendTarget24hUpdate(user);
+    return res.redirect("/dashboard?flash=success&message=Target%2024h%20update%20sent%20to%20Discord");
+  } catch (err) {
+    console.error("Target update send failed:", err);
+    return res.redirect("/dashboard?flash=error&message=Target%20update%20send%20failed.%20Set%20a%20valid%20default%20webhook.");
+  }
+});
+
+app.post("/alerts/:id/test", requireAuth, async (req, res) => {
+  const user = ownerOverride(getUserById(req.auth.sub));
+  const alertId = Number(req.params.id);
+  const target = db.prepare("SELECT * FROM alert_targets WHERE id = ? AND user_id = ?").get(alertId, user.id);
+
+  if (!target) {
+    return res.redirect("/dashboard?flash=error&message=Alert%20target%20not%20found");
+  }
+
+  try {
+    const webhook = getDiscordWebhookForTarget({ ...target, discord_webhook: user.discord_webhook });
+    if (!webhook) {
+      return res.redirect("/dashboard?flash=error&message=Missing%20Discord%20webhook%20for%20this%20target");
+    }
+    if (!isValidDiscordWebhookUrl(webhook)) {
+      return res.redirect("/dashboard?flash=error&message=Discord%20webhook%20URL%20is%20invalid");
+    }
+    await sendDiscordAlert({ ...target, channel_value: webhook }, { timeAgo: "moments ago" });
+    return res.redirect("/dashboard?flash=success&message=Test%20alert%20sent%20to%20Discord");
+  } catch (err) {
+    console.error("Test alert send failed:", err);
+    return res.redirect("/dashboard?flash=error&message=Discord%20test%20send%20failed");
+  }
+});
+
+app.post("/alerts/:id/delete", requireAuth, (req, res) => {
+  const user = ownerOverride(getUserById(req.auth.sub));
+  const alertId = Number(req.params.id);
+  db.prepare("DELETE FROM alert_targets WHERE id = ? AND user_id = ?").run(alertId, user.id);
+  res.redirect("/dashboard");
+});
+
+app.post("/pokemoncenter/discovery/run", requireAuth, async (req, res) => {
+  try {
+    const count = await runPokemonCenterDiscovery();
+    return res.redirect(`/dashboard?flash=success&message=Pokemon%20Center%20discovery%20saved%20${count}%20urls`);
+  } catch (err) {
+    console.error("Pokemon Center discovery failed:", err);
+    return res.redirect("/dashboard?flash=error&message=Pokemon%20Center%20discovery%20failed");
+  }
+});
+
+app.post("/pokemoncenter/monitor/run", requireAuth, async (req, res) => {
+  try {
+    await runPokemonCenterMonitorCycle();
+    return res.redirect("/dashboard?flash=success&message=Pokemon%20Center%20monitor%20completed");
+  } catch (err) {
+    console.error("Pokemon Center monitor failed:", err);
+    return res.redirect("/dashboard?flash=error&message=Pokemon%20Center%20monitor%20failed");
+  }
+});
+
+app.post("/pokemoncenter/digest/send", requireAuth, async (_req, res) => {
+  try {
+    await sendPokemonCenterDigest();
+    return res.redirect("/dashboard?flash=success&message=Pokemon%20Center%206-hour%20digest%20sent");
+  } catch (err) {
+    console.error("Pokemon Center digest failed:", err);
+    return res.redirect("/dashboard?flash=error&message=Pokemon%20Center%20digest%20failed");
+  }
+});
+
+app.get("/feed", requireAuth, (req, res) => {
+  const user = ownerOverride(getUserById(req.auth.sub));
+  const rows = db.prepare(`
+    SELECT e.created_at, r.name AS retailer_name, p.canonical_name, po.product_url, e.new_state, e.new_price
+    FROM events e
+    JOIN product_offers po ON po.id = e.product_offer_id
+    JOIN products p ON p.id = po.product_id
+    JOIN retailers r ON r.id = po.retailer_id
+    ORDER BY e.created_at DESC
+    LIMIT 150
+  `).all();
+  const body = `
+    <div class="card">
+      <h2>Unified Feed</h2>
+      <p class="muted">Live state changes across all stores.</p>
+      <table>
+        <thead><tr><th>Time</th><th>Store</th><th>Product</th><th>State</th><th>Price</th><th>Link</th></tr></thead>
+        <tbody>
+          ${rows.length ? rows.map((row) => `<tr><td>${escapeHtml(row.created_at)}</td><td>${escapeHtml(row.retailer_name)}</td><td>${escapeHtml(row.canonical_name)}</td><td>${escapeHtml(row.new_state)}</td><td>${row.new_price == null ? "N/A" : `$${Number(row.new_price).toFixed(2)}`}</td><td><a href="${row.product_url}" target="_blank" rel="noopener noreferrer">Open</a></td></tr>`).join("") : `<tr><td colspan="6" class="muted">No feed events yet.</td></tr>`}
+        </tbody>
+      </table>
+    </div>
+  `;
+  return res.send(renderPage("Feed", body, user));
+});
+
+app.get("/stores", requireAuth, (req, res) => {
+  const user = ownerOverride(getUserById(req.auth.sub));
+  const rows = db.prepare(`
+    SELECT sr.display_name, sr.source_type, sr.enabled, sr.polling_interval_ms,
+           mr.status, mr.started_at, mr.finished_at, mr.requests_made, mr.errors_count
+    FROM source_registry sr
+    LEFT JOIN monitor_runs mr ON mr.id = (
+      SELECT id FROM monitor_runs m2 WHERE m2.adapter_key = sr.source_key ORDER BY started_at DESC LIMIT 1
+    )
+    ORDER BY sr.source_type, sr.display_name
+  `).all();
+  const body = `
+    <div class="card">
+      <h2>Stores</h2>
+      <p class="muted">Store/source control panel with latest monitor status.</p>
+      <table>
+        <thead><tr><th>Source</th><th>Type</th><th>Enabled</th><th>Interval</th><th>Status</th><th>Last start</th><th>Req</th><th>Err</th></tr></thead>
+        <tbody>
+          ${rows.map((row) => `<tr><td>${escapeHtml(row.display_name)}</td><td>${escapeHtml(row.source_type)}</td><td>${row.enabled ? "Yes" : "No"}</td><td>${Math.round(row.polling_interval_ms / 1000)}s</td><td>${escapeHtml(row.status || "unknown")}</td><td>${escapeHtml(row.started_at || "N/A")}</td><td>${row.requests_made || 0}</td><td>${row.errors_count || 0}</td></tr>`).join("")}
+        </tbody>
+      </table>
+      <form method="post" action="/sources/run" style="margin-top:12px;"><button>Run all sources now</button></form>
+    </div>
+  `;
+  return res.send(renderPage("Stores", body, user));
+});
+
+app.get("/sightings", requireAuth, (req, res) => {
+  const user = ownerOverride(getUserById(req.auth.sub));
+  const rows = db.prepare(`
+    SELECT source_key, source_type, title, product_url, availability_state, price, detected_at
+    FROM raw_sightings
+    ORDER BY detected_at DESC
+    LIMIT 200
+  `).all();
+  const body = `
+    <div class="card">
+      <h2>Sightings</h2>
+      <p class="muted">Raw intake visibility across monitors.</p>
+      <table>
+        <thead><tr><th>Time</th><th>Source</th><th>Type</th><th>Title</th><th>State</th><th>Price</th><th>Link</th></tr></thead>
+        <tbody>
+          ${rows.length ? rows.map((row) => `<tr><td>${escapeHtml(row.detected_at)}</td><td>${escapeHtml(row.source_key)}</td><td>${escapeHtml(row.source_type)}</td><td>${escapeHtml(row.title || "N/A")}</td><td>${escapeHtml(row.availability_state)}</td><td>${row.price == null ? "N/A" : `$${Number(row.price).toFixed(2)}`}</td><td>${row.product_url ? `<a href="${row.product_url}" target="_blank" rel="noopener noreferrer">Open</a>` : "N/A"}</td></tr>`).join("") : `<tr><td colspan="7" class="muted">No sightings yet.</td></tr>`}
+        </tbody>
+      </table>
+    </div>
+  `;
+  return res.send(renderPage("Sightings", body, user));
+});
+
+app.get("/notifications", requireAuth, (req, res) => {
+  const user = ownerOverride(getUserById(req.auth.sub));
+  const rows = db.prepare(`
+    SELECT channel, status, message, created_at
+    FROM notification_logs
+    WHERE user_id = ?
+    ORDER BY created_at DESC
+    LIMIT 200
+  `).all(user.id);
+  const body = `
+    <div class="card">
+      <h2>Notifications</h2>
+      <p class="muted">Delivery audit trail for your account.</p>
+      <table>
+        <thead><tr><th>Time</th><th>Channel</th><th>Status</th><th>Message</th></tr></thead>
+        <tbody>
+          ${rows.length ? rows.map((row) => `<tr><td>${escapeHtml(row.created_at)}</td><td>${escapeHtml(row.channel)}</td><td>${escapeHtml(row.status)}</td><td>${escapeHtml(String(row.message || "").slice(0, 180))}</td></tr>`).join("") : `<tr><td colspan="4" class="muted">No notifications logged yet.</td></tr>`}
+        </tbody>
+      </table>
+    </div>
+  `;
+  return res.send(renderPage("Notifications", body, user));
+});
+
+app.get("/collection", requireAuth, (req, res) => {
+  const user = ownerOverride(getUserById(req.auth.sub));
+  const cards = db.prepare(`
+    SELECT id, set_name, card_name, card_number, rarity, quantity, market_price, average_cost, notes, updated_at
+    FROM collection_cards
+    WHERE user_id = ?
+    ORDER BY set_name ASC, card_name ASC
+  `).all(user.id);
+  const setPriceRows = db.prepare(`
+    SELECT ms.product_name, AVG(ms.price) AS avg_price, COUNT(*) AS sample_count
+    FROM market_snapshots ms
+    GROUP BY ms.product_name
+    ORDER BY ms.captured_at DESC
+    LIMIT 200
+  `).all();
+  const body = `
+    <div class="grid">
+      <div class="card">
+        <h2>Collection Tracker</h2>
+        <form method="post" action="/collection/cards/upsert">
+          <label>Set name</label>
+          <select name="set_name">${CURATED_RELEASE_MONITOR_PACK.map((set) => `<option value="${escapeHtml(set.set_name)}">${escapeHtml(set.set_name)} (${escapeHtml(set.release_date)})</option>`).join("")}</select>
+          <label style="margin-top:8px; display:block;">Card name</label><input name="card_name" required placeholder="Pikachu ex" />
+          <label style="margin-top:8px; display:block;">Card number</label><input name="card_number" placeholder="123/182" />
+          <label style="margin-top:8px; display:block;">Rarity</label><input name="rarity" placeholder="Illustration Rare" />
+          <label style="margin-top:8px; display:block;">Quantity</label><input name="quantity" type="number" min="0" value="1" />
+          <label style="margin-top:8px; display:block;">Market price</label><input name="market_price" type="number" step="0.01" />
+          <label style="margin-top:8px; display:block;">Average cost</label><input name="average_cost" type="number" step="0.01" />
+          <label style="margin-top:8px; display:block;">Notes</label><textarea name="notes" rows="2"></textarea>
+          <div style="margin-top:12px;"><button>Save card</button></div>
+        </form>
+      </div>
+      <div class="card">
+        <h2>Set Pricecharting Pulse</h2>
+        <p class="muted">Uses captured market snapshots as the internal pricecharting feed.</p>
+        <table>
+          <thead><tr><th>Product</th><th>Avg price</th><th>Samples</th></tr></thead>
+          <tbody>${setPriceRows.length ? setPriceRows.map((row) => `<tr><td>${escapeHtml(row.product_name)}</td><td>${row.avg_price == null ? "N/A" : `$${Number(row.avg_price).toFixed(2)}`}</td><td>${row.sample_count}</td></tr>`).join("") : `<tr><td colspan="3" class="muted">No market snapshots yet.</td></tr>`}</tbody>
+        </table>
+      </div>
+    </div>
+    <div class="card">
+      <h2>Your Collection Cards</h2>
+      <table>
+        <thead><tr><th>Set</th><th>Card</th><th>No.</th><th>Rarity</th><th>Qty</th><th>Market</th><th>Cost</th><th>Updated</th><th>Action</th></tr></thead>
+        <tbody>${cards.length ? cards.map((c) => `<tr><td>${escapeHtml(c.set_name)}</td><td>${escapeHtml(c.card_name)}</td><td>${escapeHtml(c.card_number || "-")}</td><td>${escapeHtml(c.rarity || "-")}</td><td>${c.quantity}</td><td>${c.market_price == null ? "-" : `$${Number(c.market_price).toFixed(2)}`}</td><td>${c.average_cost == null ? "-" : `$${Number(c.average_cost).toFixed(2)}`}</td><td>${escapeHtml(c.updated_at)}</td><td><form method="post" action="/collection/cards/${c.id}/delete"><button>Delete</button></form></td></tr>`).join("") : `<tr><td colspan="9" class="muted">No cards tracked yet.</td></tr>`}</tbody>
+      </table>
+    </div>
+  `;
+  return res.send(renderPage("Collection", body, user));
+});
+
+app.get("/catalog/matrix", requireAuth, (req, res) => {
+  const user = ownerOverride(getUserById(req.auth.sub));
+  const matrix = buildCuratedRetailMatrix();
+  const groupedBySet = CURATED_RELEASE_MONITOR_PACK.map((set) => ({
+    set,
+    rows: matrix.filter((row) => row.set_name === set.set_name)
+  }));
+  const body = `
+    <div class="card">
+      <h2>Curated Set Matrix (Set → Product Type → Store)</h2>
+      <p class="muted">All sets condensed into matrix rows with direct/search monitor links.</p>
+      ${groupedBySet.map(({ set, rows }) => `
+        <h3 style="margin-top:20px;">${escapeHtml(set.set_name)} <span class="pill">${escapeHtml(set.release_date)}</span></h3>
+        <table>
+          <thead><tr><th>Type</th><th>Pokémon Center</th><th>Best Buy</th><th>Walmart</th><th>Target</th></tr></thead>
+          <tbody>
+            ${rows.map((row) => `
+              <tr>
+                <td>${escapeHtml(row.product_type_label)}</td>
+                <td><a href="${row.pokemoncenter_etb_url || retailerSearchUrl("pokemoncenter", row.product_query)}" target="_blank" rel="noopener noreferrer">Open</a></td>
+                <td><a href="${row.bestbuy_sku ? bestBuySkuUrl(row.bestbuy_sku) : retailerSearchUrl("bestbuy", row.product_query)}" target="_blank" rel="noopener noreferrer">${row.bestbuy_sku ? `SKU ${escapeHtml(row.bestbuy_sku)}` : "Open"}</a></td>
+                <td><a href="${row.walmart_item ? walmartItemUrl(row.walmart_item) : retailerSearchUrl("walmart", row.product_query)}" target="_blank" rel="noopener noreferrer">${row.walmart_item ? `Item ${escapeHtml(row.walmart_item)}` : "Open"}</a></td>
+                <td><a href="${retailerSearchUrl("target", row.target_query || row.product_query)}" target="_blank" rel="noopener noreferrer">Open</a></td>
+              </tr>
+            `).join("")}
+          </tbody>
+        </table>
+      `).join("")}
+    </div>
+  `;
+  return res.send(renderPage("Catalog Matrix", body, user));
+});
+
+app.post("/collection/cards/upsert", requireAuth, (req, res) => {
+  const user = ownerOverride(getUserById(req.auth.sub));
+  const setName = String(req.body.set_name || "").trim();
+  const cardName = String(req.body.card_name || "").trim();
+  const cardNumber = String(req.body.card_number || "").trim() || null;
+  const rarity = String(req.body.rarity || "").trim() || null;
+  const quantity = Math.max(0, Number(req.body.quantity || 0) || 0);
+  const marketPrice = String(req.body.market_price || "").trim();
+  const averageCost = String(req.body.average_cost || "").trim();
+  const notes = String(req.body.notes || "").trim() || null;
+  if (!setName || !cardName) {
+    return res.redirect("/collection");
+  }
+  db.prepare(`
+    INSERT INTO collection_cards (user_id, set_name, card_name, card_number, rarity, quantity, market_price, average_cost, notes, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(user_id, set_name, card_name, card_number) DO UPDATE SET
+      rarity = excluded.rarity,
+      quantity = excluded.quantity,
+      market_price = excluded.market_price,
+      average_cost = excluded.average_cost,
+      notes = excluded.notes,
+      updated_at = excluded.updated_at
+  `).run(
+    user.id,
+    setName,
+    cardName,
+    cardNumber,
+    rarity,
+    quantity,
+    marketPrice ? Number(marketPrice) : null,
+    averageCost ? Number(averageCost) : null,
+    notes,
+    new Date().toISOString()
+  );
+  return res.redirect("/collection");
+});
+
+app.post("/collection/cards/:id/delete", requireAuth, (req, res) => {
+  const user = ownerOverride(getUserById(req.auth.sub));
+  db.prepare("DELETE FROM collection_cards WHERE id = ? AND user_id = ?").run(Number(req.params.id), user.id);
+  return res.redirect("/collection");
+});
+
+app.get("/pokemoncenter/feed", requireAuth, (_req, res) => {
+  const rows = db.prepare(`
+    SELECT e.created_at, p.canonical_name, po.product_url, e.old_state, e.new_state, e.old_price, e.new_price
+    FROM events e
+    JOIN product_offers po ON po.id = e.product_offer_id
+    JOIN products p ON p.id = po.product_id
+    JOIN retailers r ON r.id = po.retailer_id
+    WHERE r.adapter_key = 'pokemoncenter'
+    ORDER BY e.created_at DESC
+    LIMIT 100
+  `).all();
+  return res.json({ rows });
+});
+
+app.post("/retail/offers/add", requireAuth, (req, res) => {
+  try {
+    const retailerKey = String(req.body.retailer_key || "").trim().toLowerCase();
+    const name = String(req.body.name || "").trim();
+    const productUrl = String(req.body.product_url || "").trim();
+    const retailerSku = String(req.body.retailer_sku || "").trim();
+    if (!["bestbuy", "target", "walmart", "gamestop"].includes(retailerKey)) {
+      return res.redirect("/dashboard?flash=error&message=Unsupported%20retailer%20key");
+    }
+    if (!name || !productUrl) {
+      return res.redirect("/dashboard?flash=error&message=Retail%20offer%20name%20and%20URL%20are%20required");
+    }
+    ensureProductAndOffer(productUrl, name, null, STATES.LISTED, retailerKey, { retailerSku });
+    return res.redirect("/dashboard?flash=success&message=Retail%20offer%20added");
+  } catch (err) {
+    console.error("Retail offer add failed:", err);
+    return res.redirect("/dashboard?flash=error&message=Retail%20offer%20add%20failed");
+  }
+});
+
+app.post("/retail/monitor/run", requireAuth, async (_req, res) => {
+  try {
+    await runMajorRetailMonitorCycle();
+    return res.redirect("/dashboard?flash=success&message=Major%20retail%20monitor%20completed");
+  } catch (err) {
+    console.error("Major retail monitor failed:", err);
+    return res.redirect("/dashboard?flash=error&message=Major%20retail%20monitor%20failed");
+  }
+});
+
+app.get("/retail/feed", requireAuth, (_req, res) => {
+  const rows = db.prepare(`
+    SELECT e.created_at, r.name AS retailer_name, p.canonical_name, po.product_url, e.old_state, e.new_state, e.old_price, e.new_price
+    FROM events e
+    JOIN product_offers po ON po.id = e.product_offer_id
+    JOIN products p ON p.id = po.product_id
+    JOIN retailers r ON r.id = po.retailer_id
+    WHERE r.adapter_key IN ('bestbuy','target','walmart','gamestop')
+    ORDER BY e.created_at DESC
+    LIMIT 100
+  `).all();
+  return res.json({ rows });
+});
+
+app.get("/api/feeds/raw-sightings", requireAuth, (req, res) => {
+  const limitRaw = Number(req.query.limit || 200);
+  const limit = Math.max(1, Math.min(Number.isFinite(limitRaw) ? limitRaw : 200, 1000));
+  const sourceType = String(req.query.source_type || "").trim();
+  const rows = sourceType
+    ? db.prepare(`
+        SELECT *
+        FROM raw_sightings
+        WHERE source_type = ?
+        ORDER BY detected_at DESC
+        LIMIT ?
+      `).all(sourceType, limit)
+    : db.prepare(`
+        SELECT *
+        FROM raw_sightings
+        ORDER BY detected_at DESC
+        LIMIT ?
+      `).all(limit);
+  return res.json({ rows, count: rows.length, generated_at: new Date().toISOString() });
+});
+
+app.get("/api/feeds/normalized-offers", requireAuth, (req, res) => {
+  const limitRaw = Number(req.query.limit || 200);
+  const limit = Math.max(1, Math.min(Number.isFinite(limitRaw) ? limitRaw : 200, 1000));
+  const rows = db.prepare(`
+    SELECT no.*, p.canonical_name
+    FROM normalized_offers no
+    LEFT JOIN products p ON p.id = no.product_id
+    ORDER BY no.updated_at DESC
+    LIMIT ?
+  `).all(limit);
+  return res.json({ rows, count: rows.length, generated_at: new Date().toISOString() });
+});
+
+app.get("/api/feeds/market-sightings", requireAuth, (req, res) => {
+  const limitRaw = Number(req.query.limit || 200);
+  const limit = Math.max(1, Math.min(Number.isFinite(limitRaw) ? limitRaw : 200, 1000));
+  const rows = db.prepare(`
+    SELECT *
+    FROM raw_sightings
+    WHERE source_type IN ('marketplace', 'secondary_market')
+    ORDER BY detected_at DESC
+    LIMIT ?
+  `).all(limit);
+  return res.json({ rows, count: rows.length, generated_at: new Date().toISOString() });
+});
+
+app.get("/api/admin/pipeline-traces", requireAuth, (req, res) => {
+  const user = ownerOverride(getUserById(req.auth.sub));
+  if (user.role !== "owner") {
+    return res.status(403).json({ error: "forbidden" });
+  }
+  const rows = db.prepare(`
+    SELECT *
+    FROM pipeline_traces
+    ORDER BY created_at DESC
+    LIMIT 200
+  `).all();
+  return res.json({ rows, count: rows.length, generated_at: new Date().toISOString() });
+});
+
+app.get("/api/sources/status", requireAuth, (_req, res) => {
+  const rows = db.prepare(`
+    SELECT sr.source_key, sr.source_type, sr.display_name, sr.enabled, sr.polling_interval_ms, sr.concurrency_limit,
+           mr.status AS last_status, mr.started_at AS last_started_at, mr.finished_at AS last_finished_at,
+           mr.requests_made, mr.errors_count
+    FROM source_registry sr
+    LEFT JOIN monitor_runs mr ON mr.id = (
+      SELECT id FROM monitor_runs m2
+      WHERE m2.adapter_key = sr.source_key
+      ORDER BY started_at DESC
+      LIMIT 1
+    )
+    ORDER BY sr.source_type, sr.source_key
+  `).all();
+  return res.json({ rows, count: rows.length, generated_at: new Date().toISOString() });
+});
+
+app.post("/api/sources/run", requireAuth, async (req, res) => {
+  try {
+    const results = await runSourceRegistryCycle();
+    return res.json({ ok: true, results, generated_at: new Date().toISOString() });
+  } catch (err) {
+    return res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.post("/sources/run", requireAuth, async (_req, res) => {
+  try {
+    await runSourceRegistryCycle();
+    return res.redirect("/dashboard?flash=success&message=Source%20registry%20run%20completed");
+  } catch (err) {
+    return res.redirect("/dashboard?flash=error&message=Source%20registry%20run%20failed");
+  }
+});
+
+app.post("/api/admin/sources/upsert", requireAuth, (req, res) => {
+  const user = ownerOverride(getUserById(req.auth.sub));
+  if (user.role !== "owner") {
+    return res.status(403).json({ error: "forbidden" });
+  }
+  try {
+    upsertSource(db, req.body || {});
+    return res.json({ ok: true });
+  } catch (err) {
+    return res.status(400).json({ ok: false, error: err.message });
+  }
+});
+
+app.get("/api/monitor/snapshots", requireAuth, (req, res) => {
+  const limitRaw = Number(req.query.limit || 100);
+  const limit = Math.max(1, Math.min(Number.isFinite(limitRaw) ? limitRaw : 100, 500));
+  const rows = db.prepare(`
+    SELECT ms.id, ms.retailer_key, ms.product_offer_id, ms.product_url, ms.availability_state,
+           ms.confidence_score, ms.detected_at, po.current_state, p.canonical_name
+    FROM monitor_snapshots ms
+    LEFT JOIN product_offers po ON po.id = ms.product_offer_id
+    LEFT JOIN products p ON p.id = po.product_id
+    ORDER BY ms.detected_at DESC
+    LIMIT ?
+  `).all(limit);
+  return res.json({ rows, count: rows.length, generated_at: new Date().toISOString() });
+});
+
+app.get("/api/monitor/snapshots/:id", requireAuth, (req, res) => {
+  const id = Number(req.params.id);
+  const row = db.prepare(`
+    SELECT ms.*, po.current_state, p.canonical_name
+    FROM monitor_snapshots ms
+    LEFT JOIN product_offers po ON po.id = ms.product_offer_id
+    LEFT JOIN products p ON p.id = po.product_id
+    WHERE ms.id = ?
+  `).get(id);
+  if (!row) {
+    return res.status(404).json({ error: "snapshot_not_found" });
+  }
+  return res.json({ row });
+});
+
+app.get("/api/notifications/logs", requireAuth, (req, res) => {
+  const limitRaw = Number(req.query.limit || 100);
+  const limit = Math.max(1, Math.min(Number.isFinite(limitRaw) ? limitRaw : 100, 500));
+  const rows = db.prepare(`
+    SELECT nl.id, nl.user_id, u.email, nl.channel, nl.status, nl.message, nl.created_at
+    FROM notification_logs nl
+    LEFT JOIN users u ON u.id = nl.user_id
+    ORDER BY nl.created_at DESC
+    LIMIT ?
+  `).all(limit);
+  return res.json({ rows, count: rows.length, generated_at: new Date().toISOString() });
+});
+
+app.post("/admin/notifications/process", requireAuth, async (req, res) => {
+  const user = ownerOverride(getUserById(req.auth.sub));
+  if (user.role !== "owner") {
+    return res.status(403).json({ error: "forbidden" });
+  }
+
+  try {
+    const limitRaw = Number(req.body.limit || req.query.limit || 50);
+    const limit = Math.max(1, Math.min(Number.isFinite(limitRaw) ? limitRaw : 50, 200));
+    const result = await processQueuedNotifications(db, { limit });
+    return res.json({ ok: true, ...result });
+  } catch (err) {
+    console.error("notification queue processing failed:", err);
+    return res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.post("/market/snapshot", requireAuth, (req, res) => {
+  const user = ownerOverride(getUserById(req.auth.sub));
+  if (user.role !== "owner") {
+    return res.status(403).send("Forbidden");
+  }
+
+  const productName = String(req.body.product_name || "").trim();
+  const sourceName = String(req.body.source_name || "").trim();
+  const priceRaw = String(req.body.price || "").trim();
+  const url = String(req.body.url || "").trim();
+  const price = priceRaw ? Number(priceRaw) : null;
+  if (!productName || !sourceName) {
+    return res.redirect("/dashboard?flash=error&message=Market%20snapshot%20requires%20product%20and%20source");
+  }
+
+  db.prepare(`
+    INSERT INTO market_snapshots (product_name, source_name, price, url)
+    VALUES (?, ?, ?, ?)
+  `).run(productName, sourceName, Number.isFinite(price) ? price : null, url || null);
+
+  return res.redirect("/dashboard?flash=success&message=Market%20snapshot%20saved");
+});
+
+app.get("/api/public/feed", (_req, res) => {
+  const events = db.prepare(`
+    SELECT e.created_at, r.name AS retailer, p.canonical_name, po.product_url, e.new_state, e.new_price
+    FROM events e
+    JOIN product_offers po ON po.id = e.product_offer_id
+    JOIN products p ON p.id = po.product_id
+    JOIN retailers r ON r.id = po.retailer_id
+    ORDER BY e.created_at DESC
+    LIMIT 50
+  `).all();
+  return res.json({ events, generated_at: new Date().toISOString() });
+});
+
+app.get("/calendar", requireAuth, (req, res) => {
+  const user = ownerOverride(getUserById(req.auth.sub));
+  const rows = db.prepare(`
+    SELECT *
+    FROM release_calendar
+    ORDER BY release_date ASC
+    LIMIT 200
+  `).all();
+
+  const items = rows.length
+    ? rows.map((item) => `
+      <tr>
+        <td>${escapeHtml(item.release_date)}</td>
+        <td>${escapeHtml(item.title)}</td>
+        <td>${escapeHtml(item.set_name || "")}</td>
+        <td>${escapeHtml(item.notes || "")}</td>
+        <td>${item.source_url ? `<a href="${item.source_url}" target="_blank" rel="noopener noreferrer">Open</a>` : ""}</td>
+      </tr>
+    `).join("")
+    : `<tr><td colspan="5" class="muted">No release calendar entries yet.</td></tr>`;
+
+  const ownerForm = user.role === "owner" ? `
+    <div class="card">
+      <h2>Add release</h2>
+      <form method="post" action="/calendar/add">
+        <label>Title</label><input name="title" required />
+        <label style="margin-top:12px; display:block;">Set name</label><input name="set_name" />
+        <label style="margin-top:12px; display:block;">Release date</label><input type="date" name="release_date" required />
+        <label style="margin-top:12px; display:block;">Source URL</label><input type="url" name="source_url" />
+        <label style="margin-top:12px; display:block;">Notes</label><textarea name="notes"></textarea>
+        <div style="margin-top:12px;"><button>Add release</button></div>
+      </form>
+    </div>
+  ` : "";
+
+  const body = `
+    ${ownerForm}
+    <div class="card">
+      <h2>Release calendar</h2>
+      <table>
+        <thead><tr><th>Date</th><th>Title</th><th>Set</th><th>Notes</th><th>Source</th></tr></thead>
+        <tbody>${items}</tbody>
+      </table>
+      <div style="margin-top:12px;"><a href="/dashboard"><button>Back to dashboard</button></a></div>
+    </div>
+  `;
+
+  return res.send(renderPage("Release Calendar", body, user));
+});
+
+app.post("/calendar/add", requireAuth, (req, res) => {
+  const user = ownerOverride(getUserById(req.auth.sub));
+  if (user.role !== "owner") {
+    return res.status(403).send("Forbidden");
+  }
+
+  const title = String(req.body.title || "").trim();
+  const setName = String(req.body.set_name || "").trim();
+  const releaseDate = String(req.body.release_date || "").trim();
+  const sourceUrl = String(req.body.source_url || "").trim();
+  const notes = String(req.body.notes || "").trim();
+  if (!title || !releaseDate) {
+    return res.redirect("/calendar");
+  }
+
+  db.prepare(`
+    INSERT INTO release_calendar (title, set_name, release_date, notes, source_url, created_by_user_id)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `).run(title, setName || null, releaseDate, notes || null, sourceUrl || null, user.id);
+
+  return res.redirect("/calendar");
+});
+
+app.get("/health/dashboard", requireAuth, (req, res) => {
+  const user = ownerOverride(getUserById(req.auth.sub));
+  const runs = db.prepare(`
+    SELECT adapter_key, status, started_at, finished_at, requests_made, errors_count,
+           ROUND((julianday(finished_at) - julianday(started_at)) * 86400000) AS duration_ms
+    FROM monitor_runs
+    ORDER BY started_at DESC
+    LIMIT 100
+  `).all();
+  const stats = db.prepare(`
+    SELECT COUNT(*) AS total_runs,
+           SUM(CASE WHEN status = 'ok' THEN 1 ELSE 0 END) AS ok_runs,
+           SUM(CASE WHEN status != 'ok' THEN 1 ELSE 0 END) AS failed_runs,
+           AVG(CASE WHEN finished_at IS NOT NULL THEN (julianday(finished_at) - julianday(started_at)) * 86400000 END) AS avg_duration_ms
+    FROM monitor_runs
+  `).get();
+
+  const rows = runs.length
+    ? runs.map((run) => `<tr><td>${escapeHtml(run.adapter_key)}</td><td>${escapeHtml(run.status)}</td><td>${escapeHtml(run.started_at)}</td><td>${run.duration_ms || ""}</td><td>${run.requests_made}</td><td>${run.errors_count}</td></tr>`).join("")
+    : `<tr><td colspan="6" class="muted">No monitor runs recorded yet.</td></tr>`;
+
+  const body = `
+    <div class="card">
+      <h2>Health dashboard</h2>
+      <p>Total runs: ${stats.total_runs || 0}</p>
+      <p>OK runs: ${stats.ok_runs || 0}</p>
+      <p>Failed runs: ${stats.failed_runs || 0}</p>
+      <p>Average duration: ${stats.avg_duration_ms ? Math.round(stats.avg_duration_ms) : 0} ms</p>
+      <table>
+        <thead><tr><th>Adapter</th><th>Status</th><th>Started</th><th>Duration ms</th><th>Requests</th><th>Errors</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+      <div style="margin-top:12px;"><a href="/dashboard"><button>Back to dashboard</button></a></div>
+    </div>
+  `;
+
+  return res.send(renderPage("Health Dashboard", body, user));
+});
+
+app.post("/create-checkout-session", requireAuth, async (req, res) => {
+  const user = ownerOverride(getUserById(req.auth.sub));
+  const planId = String(req.body.planId || "");
+  const plan = PLANS[planId];
+  if (!plan || !plan.stripePriceEnv) {
+    return res.status(400).send("Unknown paid plan");
+  }
+  if (!stripe) {
+    return res.status(500).send("Stripe is not configured");
+  }
+  const priceId = process.env[plan.stripePriceEnv];
+  if (!priceId) {
+    return res.status(500).send(`Missing ${plan.stripePriceEnv}`);
+  }
+
+  let customerId = user.stripe_customer_id;
+  if (!customerId) {
+    const customer = await stripe.customers.create({
+      email: user.email,
+      metadata: { userId: String(user.id) }
+    });
+    customerId = customer.id;
+    db.prepare("UPDATE users SET stripe_customer_id = ? WHERE id = ?").run(customerId, user.id);
+  }
+
+  const session = await stripe.checkout.sessions.create({
+    mode: "subscription",
+    customer: customerId,
+    line_items: [{ price: priceId, quantity: 1 }],
+    success_url: `${APP_URL}/dashboard?checkout=success`,
+    cancel_url: `${APP_URL}/pricing?checkout=canceled`,
+    metadata: {
+      userId: String(user.id),
+      planId: plan.id
+    }
+  });
+
+  res.redirect(303, session.url);
+});
+
+app.get("/health", (_req, res) => {
+  res.json({ ok: true });
+});
+
+function startSchedulers() {
+  if (AUTO_SCAN_ENABLED) {
+    setInterval(async () => {
+      try {
+        await runAutomatedScan(null, { targetOnly: true });
+      } catch (err) {
+        console.error("Automated scan failed:", err);
+      } finally {
+        if (AUTO_SEND_TARGET_UPDATES) {
+          await sendAutomatedTargetUpdates();
+        }
+      }
+    }, AUTO_SCAN_INTERVAL_MS);
+  }
+
+  if (POKEMON_CENTER_MONITOR_ENABLED) {
+    setInterval(async () => {
+      try {
+        await runPokemonCenterMonitorCycle();
+      } catch (err) {
+        console.error("Pokemon Center automated monitor failed:", err);
+      }
+    }, POKEMON_CENTER_MONITOR_INTERVAL_MS);
+
+    setInterval(async () => {
+      try {
+        await sendPokemonCenterDigest();
+      } catch (err) {
+        console.error("Pokemon Center automated digest failed:", err);
+      }
+    }, POKEMON_CENTER_DIGEST_INTERVAL_MS);
+  }
+
+  if (MAJOR_RETAIL_MONITOR_ENABLED) {
+    setInterval(async () => {
+      try {
+        await runMajorRetailMonitorCycle();
+      } catch (err) {
+        console.error("Major retail automated monitor failed:", err);
+      }
+    }, MAJOR_RETAIL_MONITOR_INTERVAL_MS);
+  }
+
+  if (SOURCE_REGISTRY_MONITOR_ENABLED) {
+    setInterval(async () => {
+      try {
+        await runSourceRegistryCycle();
+      } catch (err) {
+        console.error("Source registry cycle failed:", err);
+      }
+    }, SOURCE_REGISTRY_MONITOR_INTERVAL_MS);
+  }
+}
+
+function logStartupConfig() {
+  console.log(`Pokemon Alerts SaaS running on ${APP_URL}`);
+  if (AUTO_SCAN_ENABLED) {
+    console.log(`Automated scans enabled every ${AUTO_SCAN_INTERVAL_MS}ms`);
+    console.log(`Automated Target updates every interval: ${AUTO_SEND_TARGET_UPDATES ? "on" : "off"}`);
+  } else {
+    console.log("Automated scans disabled");
+  }
+  if (POKEMON_CENTER_MONITOR_ENABLED) {
+    console.log(`Pokemon Center monitor enabled every ${POKEMON_CENTER_MONITOR_INTERVAL_MS}ms`);
+    console.log(`Pokemon Center digest enabled every ${POKEMON_CENTER_DIGEST_INTERVAL_MS}ms`);
+  } else {
+    console.log("Pokemon Center monitor disabled");
+  }
+  if (MAJOR_RETAIL_MONITOR_ENABLED) {
+    console.log(`Major retail monitor enabled every ${MAJOR_RETAIL_MONITOR_INTERVAL_MS}ms`);
+  } else {
+    console.log("Major retail monitor disabled");
+  }
+  if (SOURCE_REGISTRY_MONITOR_ENABLED) {
+    console.log(`Source registry monitor enabled every ${SOURCE_REGISTRY_MONITOR_INTERVAL_MS}ms`);
+  } else {
+    console.log("Source registry monitor disabled");
+  }
+}
+
+try {
+  bootstrapCuratedOffers();
+} catch (err) {
+  console.error("Initial curated offer bootstrap failed:", err.message);
+}
+
+module.exports = {
+  app,
+  db,
+  constants: {
+    PORT,
+    APP_URL,
+    AUTO_SCAN_ENABLED,
+    AUTO_SCAN_INTERVAL_MS,
+    AUTO_SEND_TARGET_UPDATES,
+    POKEMON_CENTER_MONITOR_ENABLED,
+    POKEMON_CENTER_MONITOR_INTERVAL_MS,
+    POKEMON_CENTER_DIGEST_INTERVAL_MS,
+    MAJOR_RETAIL_MONITOR_ENABLED,
+    MAJOR_RETAIL_MONITOR_INTERVAL_MS,
+    SOURCE_REGISTRY_MONITOR_ENABLED,
+    SOURCE_REGISTRY_MONITOR_INTERVAL_MS
+  },
+  startSchedulers,
+  logStartupConfig,
+  tasks: {
+    runAutomatedScan,
+    runPokemonCenterDiscovery,
+    runPokemonCenterMonitorCycle,
+    runMajorRetailMonitorCycle,
+    runSourceRegistryCycle,
+    sendPokemonCenterDigest,
+    sendTarget24hUpdate,
+    sendAutomatedTargetUpdates
+  }
+};
