@@ -38,7 +38,7 @@ const {
   recordSuppression,
   recordPipelineTrace
 } = require("./services/ingestion-visibility");
-const { LAST_10_RELEASED_SETS, PRODUCT_TYPE_TERMS, CURATED_RELEASE_MONITOR_PACK, buildCatalogQueries } = require("./services/set-catalog");
+const { LAST_10_RELEASED_SETS, PRODUCT_TYPE_TERMS, CURATED_RELEASE_MONITOR_PACK, CURATED_PRODUCT_TYPES, buildCuratedRetailMatrix, buildCatalogQueries } = require("./services/set-catalog");
 
 const app = express();
 const db = createDb(path.join(__dirname, "..", "app.db"));
@@ -111,10 +111,11 @@ function renderPage(title, body, user = null) {
       <aside class="sidebar">
         <div class="sidebar-logo">PokéAlerts</div>
         <a href="/dashboard">Dashboard</a>
-        <a href="/pokemoncenter/feed">Feed</a>
-        <a href="/retail/feed">Stores</a>
-        <a href="/api/feeds/raw-sightings">Sightings</a>
-        <a href="/api/notifications/logs">Notifications</a>
+        <a href="/feed">Feed</a>
+        <a href="/stores">Stores</a>
+        <a href="/sightings">Sightings</a>
+        <a href="/notifications">Notifications</a>
+        <a href="/collection">Collection</a>
         <a href="/health/dashboard">Ops</a>
         <a href="/pricing">Billing</a>
         <form method="post" action="/logout" style="margin-top:auto;"><button class="linkbutton">Logout</button></form>
@@ -1546,6 +1547,51 @@ function walmartItemUrl(itemId) {
   return `https://www.walmart.com/ip/${clean}`;
 }
 
+function bootstrapCuratedOffers() {
+  const existingOffers = new Set(db.prepare("SELECT product_url FROM product_offers").all().map((row) => normalizeUrlLoose(row.product_url)));
+  const curatedMatrix = buildCuratedRetailMatrix();
+  for (const rowSpec of curatedMatrix) {
+    const title = `${rowSpec.set_name} ${rowSpec.product_type_label}`;
+    const rows = [
+      {
+        adapter: "pokemoncenter",
+        product_url: rowSpec.pokemoncenter_etb_url || retailerSearchUrl("pokemoncenter", rowSpec.product_query),
+        retailer_sku: null
+      },
+      {
+        adapter: "bestbuy",
+        product_url: rowSpec.bestbuy_sku ? bestBuySkuUrl(rowSpec.bestbuy_sku) : retailerSearchUrl("bestbuy", rowSpec.product_query),
+        retailer_sku: rowSpec.bestbuy_sku || null
+      },
+      {
+        adapter: "walmart",
+        product_url: rowSpec.walmart_item ? walmartItemUrl(rowSpec.walmart_item) : retailerSearchUrl("walmart", rowSpec.product_query),
+        retailer_sku: rowSpec.walmart_item || null
+      },
+      {
+        adapter: "target",
+        product_url: retailerSearchUrl("target", rowSpec.target_query || rowSpec.product_query),
+        retailer_sku: null
+      }
+    ];
+    for (const row of rows) {
+      const normalizedUrl = normalizeUrlLoose(row.product_url);
+      if (!normalizedUrl || existingOffers.has(normalizedUrl)) continue;
+      try {
+        const ensured = ensureProductAndOffer(row.product_url, title, null, STATES.LISTED, row.adapter, { retailerSku: row.retailer_sku });
+        db.prepare("UPDATE products SET set_name = COALESCE(set_name, ?), product_type = COALESCE(product_type, ?) WHERE id = ?")
+          .run(rowSpec.set_name, rowSpec.product_type_label, ensured.product.id);
+        if (row.retailer_sku) {
+          db.prepare("UPDATE product_offers SET retailer_sku = COALESCE(retailer_sku, ?) WHERE id = ?").run(row.retailer_sku, ensured.offer.id);
+        }
+        existingOffers.add(normalizedUrl);
+      } catch (err) {
+        console.error("Curated offer bootstrap failed:", err.message);
+      }
+    }
+  }
+}
+
 function statusLabel(status) {
   if (status === "in_stock") return "IN STOCK";
   if (status === "out_of_stock") return "OUT OF STOCK";
@@ -2204,6 +2250,7 @@ app.get("/dashboard", requireAuth, (req, res) => {
         <form method="post" action="/catalog/import-curated-release-pack" style="margin-top:10px;">
           <button>Import curated multi-retailer release pack</button>
         </form>
+        <a href="/catalog/matrix"><button style="margin-top:10px;">Open condensed set matrix</button></a>
       </div>
       <div class="card">
         <h2>Add alert target</h2>
@@ -2503,34 +2550,44 @@ app.post("/catalog/import-curated-release-pack", requireAuth, (req, res) => {
       .map((row) => `${normalizeRetailer(row.retailer)}|${normalizeUrlLoose(row.product_url)}`)
   );
 
-  for (const set of CURATED_RELEASE_MONITOR_PACK) {
+  const curatedMatrix = buildCuratedRetailMatrix();
+  for (const rowSpec of curatedMatrix) {
+    const title = `${rowSpec.set_name} ${rowSpec.product_type_label}`;
     const records = [
       {
-        name: `${set.set_name} ETB`,
+        name: title,
+        set_name: rowSpec.set_name,
+        product_type: rowSpec.product_type_label,
         retailer: "Pokemon Center",
         adapter: "pokemoncenter",
-        product_url: set.pokemoncenter_etb_url,
+        product_url: rowSpec.pokemoncenter_etb_url || retailerSearchUrl("pokemoncenter", rowSpec.product_query),
         retailer_sku: null
       },
       {
-        name: `${set.set_name} ETB`,
+        name: title,
+        set_name: rowSpec.set_name,
+        product_type: rowSpec.product_type_label,
         retailer: "Best Buy",
         adapter: "bestbuy",
-        product_url: bestBuySkuUrl(set.bestbuy_sku) || retailerSearchUrl("bestbuy", `${set.set_name} elite trainer box`),
-        retailer_sku: set.bestbuy_sku || null
+        product_url: rowSpec.bestbuy_sku ? bestBuySkuUrl(rowSpec.bestbuy_sku) : retailerSearchUrl("bestbuy", rowSpec.product_query),
+        retailer_sku: rowSpec.bestbuy_sku || null
       },
       {
-        name: `${set.set_name} ETB`,
+        name: title,
+        set_name: rowSpec.set_name,
+        product_type: rowSpec.product_type_label,
         retailer: "Walmart",
         adapter: "walmart",
-        product_url: walmartItemUrl(set.walmart_item) || retailerSearchUrl("walmart", `${set.set_name} elite trainer box`),
-        retailer_sku: set.walmart_item || null
+        product_url: rowSpec.walmart_item ? walmartItemUrl(rowSpec.walmart_item) : retailerSearchUrl("walmart", rowSpec.product_query),
+        retailer_sku: rowSpec.walmart_item || null
       },
       {
-        name: `${set.set_name} ETB`,
+        name: title,
+        set_name: rowSpec.set_name,
+        product_type: rowSpec.product_type_label,
         retailer: "Target",
         adapter: "target",
-        product_url: retailerSearchUrl("target", set.target_query || `${set.set_name} elite trainer box`),
+        product_url: retailerSearchUrl("target", rowSpec.target_query || rowSpec.product_query),
         retailer_sku: null
       }
     ].filter((row) => row.product_url);
@@ -2540,6 +2597,8 @@ app.post("/catalog/import-curated-release-pack", requireAuth, (req, res) => {
       if (!existingOffers.has(normalizedUrl)) {
         try {
           const ensured = ensureProductAndOffer(row.product_url, row.name, null, STATES.LISTED, row.adapter, { retailerSku: row.retailer_sku });
+          db.prepare("UPDATE products SET set_name = COALESCE(set_name, ?), product_type = COALESCE(product_type, ?) WHERE id = ?")
+            .run(row.set_name, row.product_type, ensured.product.id);
           if (row.retailer_sku) {
             db.prepare("UPDATE product_offers SET retailer_sku = COALESCE(retailer_sku, ?) WHERE id = ?").run(row.retailer_sku, ensured.offer.id);
           }
@@ -2647,6 +2706,235 @@ app.post("/pokemoncenter/digest/send", requireAuth, async (_req, res) => {
     console.error("Pokemon Center digest failed:", err);
     return res.redirect("/dashboard?flash=error&message=Pokemon%20Center%20digest%20failed");
   }
+});
+
+app.get("/feed", requireAuth, (req, res) => {
+  const user = ownerOverride(getUserById(req.auth.sub));
+  const rows = db.prepare(`
+    SELECT e.created_at, r.name AS retailer_name, p.canonical_name, po.product_url, e.new_state, e.new_price
+    FROM events e
+    JOIN product_offers po ON po.id = e.product_offer_id
+    JOIN products p ON p.id = po.product_id
+    JOIN retailers r ON r.id = po.retailer_id
+    ORDER BY e.created_at DESC
+    LIMIT 150
+  `).all();
+  const body = `
+    <div class="card">
+      <h2>Unified Feed</h2>
+      <p class="muted">Live state changes across all stores.</p>
+      <table>
+        <thead><tr><th>Time</th><th>Store</th><th>Product</th><th>State</th><th>Price</th><th>Link</th></tr></thead>
+        <tbody>
+          ${rows.length ? rows.map((row) => `<tr><td>${escapeHtml(row.created_at)}</td><td>${escapeHtml(row.retailer_name)}</td><td>${escapeHtml(row.canonical_name)}</td><td>${escapeHtml(row.new_state)}</td><td>${row.new_price == null ? "N/A" : `$${Number(row.new_price).toFixed(2)}`}</td><td><a href="${row.product_url}" target="_blank" rel="noopener noreferrer">Open</a></td></tr>`).join("") : `<tr><td colspan="6" class="muted">No feed events yet.</td></tr>`}
+        </tbody>
+      </table>
+    </div>
+  `;
+  return res.send(renderPage("Feed", body, user));
+});
+
+app.get("/stores", requireAuth, (req, res) => {
+  const user = ownerOverride(getUserById(req.auth.sub));
+  const rows = db.prepare(`
+    SELECT sr.display_name, sr.source_type, sr.enabled, sr.polling_interval_ms,
+           mr.status, mr.started_at, mr.finished_at, mr.requests_made, mr.errors_count
+    FROM source_registry sr
+    LEFT JOIN monitor_runs mr ON mr.id = (
+      SELECT id FROM monitor_runs m2 WHERE m2.adapter_key = sr.source_key ORDER BY started_at DESC LIMIT 1
+    )
+    ORDER BY sr.source_type, sr.display_name
+  `).all();
+  const body = `
+    <div class="card">
+      <h2>Stores</h2>
+      <p class="muted">Store/source control panel with latest monitor status.</p>
+      <table>
+        <thead><tr><th>Source</th><th>Type</th><th>Enabled</th><th>Interval</th><th>Status</th><th>Last start</th><th>Req</th><th>Err</th></tr></thead>
+        <tbody>
+          ${rows.map((row) => `<tr><td>${escapeHtml(row.display_name)}</td><td>${escapeHtml(row.source_type)}</td><td>${row.enabled ? "Yes" : "No"}</td><td>${Math.round(row.polling_interval_ms / 1000)}s</td><td>${escapeHtml(row.status || "unknown")}</td><td>${escapeHtml(row.started_at || "N/A")}</td><td>${row.requests_made || 0}</td><td>${row.errors_count || 0}</td></tr>`).join("")}
+        </tbody>
+      </table>
+      <form method="post" action="/sources/run" style="margin-top:12px;"><button>Run all sources now</button></form>
+    </div>
+  `;
+  return res.send(renderPage("Stores", body, user));
+});
+
+app.get("/sightings", requireAuth, (req, res) => {
+  const user = ownerOverride(getUserById(req.auth.sub));
+  const rows = db.prepare(`
+    SELECT source_key, source_type, title, product_url, availability_state, price, detected_at
+    FROM raw_sightings
+    ORDER BY detected_at DESC
+    LIMIT 200
+  `).all();
+  const body = `
+    <div class="card">
+      <h2>Sightings</h2>
+      <p class="muted">Raw intake visibility across monitors.</p>
+      <table>
+        <thead><tr><th>Time</th><th>Source</th><th>Type</th><th>Title</th><th>State</th><th>Price</th><th>Link</th></tr></thead>
+        <tbody>
+          ${rows.length ? rows.map((row) => `<tr><td>${escapeHtml(row.detected_at)}</td><td>${escapeHtml(row.source_key)}</td><td>${escapeHtml(row.source_type)}</td><td>${escapeHtml(row.title || "N/A")}</td><td>${escapeHtml(row.availability_state)}</td><td>${row.price == null ? "N/A" : `$${Number(row.price).toFixed(2)}`}</td><td>${row.product_url ? `<a href="${row.product_url}" target="_blank" rel="noopener noreferrer">Open</a>` : "N/A"}</td></tr>`).join("") : `<tr><td colspan="7" class="muted">No sightings yet.</td></tr>`}
+        </tbody>
+      </table>
+    </div>
+  `;
+  return res.send(renderPage("Sightings", body, user));
+});
+
+app.get("/notifications", requireAuth, (req, res) => {
+  const user = ownerOverride(getUserById(req.auth.sub));
+  const rows = db.prepare(`
+    SELECT channel, status, message, created_at
+    FROM notification_logs
+    WHERE user_id = ?
+    ORDER BY created_at DESC
+    LIMIT 200
+  `).all(user.id);
+  const body = `
+    <div class="card">
+      <h2>Notifications</h2>
+      <p class="muted">Delivery audit trail for your account.</p>
+      <table>
+        <thead><tr><th>Time</th><th>Channel</th><th>Status</th><th>Message</th></tr></thead>
+        <tbody>
+          ${rows.length ? rows.map((row) => `<tr><td>${escapeHtml(row.created_at)}</td><td>${escapeHtml(row.channel)}</td><td>${escapeHtml(row.status)}</td><td>${escapeHtml(String(row.message || "").slice(0, 180))}</td></tr>`).join("") : `<tr><td colspan="4" class="muted">No notifications logged yet.</td></tr>`}
+        </tbody>
+      </table>
+    </div>
+  `;
+  return res.send(renderPage("Notifications", body, user));
+});
+
+app.get("/collection", requireAuth, (req, res) => {
+  const user = ownerOverride(getUserById(req.auth.sub));
+  const cards = db.prepare(`
+    SELECT id, set_name, card_name, card_number, rarity, quantity, market_price, average_cost, notes, updated_at
+    FROM collection_cards
+    WHERE user_id = ?
+    ORDER BY set_name ASC, card_name ASC
+  `).all(user.id);
+  const setPriceRows = db.prepare(`
+    SELECT ms.product_name, AVG(ms.price) AS avg_price, COUNT(*) AS sample_count
+    FROM market_snapshots ms
+    GROUP BY ms.product_name
+    ORDER BY ms.captured_at DESC
+    LIMIT 200
+  `).all();
+  const body = `
+    <div class="grid">
+      <div class="card">
+        <h2>Collection Tracker</h2>
+        <form method="post" action="/collection/cards/upsert">
+          <label>Set name</label>
+          <select name="set_name">${CURATED_RELEASE_MONITOR_PACK.map((set) => `<option value="${escapeHtml(set.set_name)}">${escapeHtml(set.set_name)} (${escapeHtml(set.release_date)})</option>`).join("")}</select>
+          <label style="margin-top:8px; display:block;">Card name</label><input name="card_name" required placeholder="Pikachu ex" />
+          <label style="margin-top:8px; display:block;">Card number</label><input name="card_number" placeholder="123/182" />
+          <label style="margin-top:8px; display:block;">Rarity</label><input name="rarity" placeholder="Illustration Rare" />
+          <label style="margin-top:8px; display:block;">Quantity</label><input name="quantity" type="number" min="0" value="1" />
+          <label style="margin-top:8px; display:block;">Market price</label><input name="market_price" type="number" step="0.01" />
+          <label style="margin-top:8px; display:block;">Average cost</label><input name="average_cost" type="number" step="0.01" />
+          <label style="margin-top:8px; display:block;">Notes</label><textarea name="notes" rows="2"></textarea>
+          <div style="margin-top:12px;"><button>Save card</button></div>
+        </form>
+      </div>
+      <div class="card">
+        <h2>Set Pricecharting Pulse</h2>
+        <p class="muted">Uses captured market snapshots as the internal pricecharting feed.</p>
+        <table>
+          <thead><tr><th>Product</th><th>Avg price</th><th>Samples</th></tr></thead>
+          <tbody>${setPriceRows.length ? setPriceRows.map((row) => `<tr><td>${escapeHtml(row.product_name)}</td><td>${row.avg_price == null ? "N/A" : `$${Number(row.avg_price).toFixed(2)}`}</td><td>${row.sample_count}</td></tr>`).join("") : `<tr><td colspan="3" class="muted">No market snapshots yet.</td></tr>`}</tbody>
+        </table>
+      </div>
+    </div>
+    <div class="card">
+      <h2>Your Collection Cards</h2>
+      <table>
+        <thead><tr><th>Set</th><th>Card</th><th>No.</th><th>Rarity</th><th>Qty</th><th>Market</th><th>Cost</th><th>Updated</th><th>Action</th></tr></thead>
+        <tbody>${cards.length ? cards.map((c) => `<tr><td>${escapeHtml(c.set_name)}</td><td>${escapeHtml(c.card_name)}</td><td>${escapeHtml(c.card_number || "-")}</td><td>${escapeHtml(c.rarity || "-")}</td><td>${c.quantity}</td><td>${c.market_price == null ? "-" : `$${Number(c.market_price).toFixed(2)}`}</td><td>${c.average_cost == null ? "-" : `$${Number(c.average_cost).toFixed(2)}`}</td><td>${escapeHtml(c.updated_at)}</td><td><form method="post" action="/collection/cards/${c.id}/delete"><button>Delete</button></form></td></tr>`).join("") : `<tr><td colspan="9" class="muted">No cards tracked yet.</td></tr>`}</tbody>
+      </table>
+    </div>
+  `;
+  return res.send(renderPage("Collection", body, user));
+});
+
+app.get("/catalog/matrix", requireAuth, (req, res) => {
+  const user = ownerOverride(getUserById(req.auth.sub));
+  const matrix = buildCuratedRetailMatrix();
+  const groupedBySet = CURATED_RELEASE_MONITOR_PACK.map((set) => ({
+    set,
+    rows: matrix.filter((row) => row.set_name === set.set_name)
+  }));
+  const body = `
+    <div class="card">
+      <h2>Curated Set Matrix (Set → Product Type → Store)</h2>
+      <p class="muted">All sets condensed into matrix rows with direct/search monitor links.</p>
+      ${groupedBySet.map(({ set, rows }) => `
+        <h3 style="margin-top:20px;">${escapeHtml(set.set_name)} <span class="pill">${escapeHtml(set.release_date)}</span></h3>
+        <table>
+          <thead><tr><th>Type</th><th>Pokémon Center</th><th>Best Buy</th><th>Walmart</th><th>Target</th></tr></thead>
+          <tbody>
+            ${rows.map((row) => `
+              <tr>
+                <td>${escapeHtml(row.product_type_label)}</td>
+                <td><a href="${row.pokemoncenter_etb_url || retailerSearchUrl("pokemoncenter", row.product_query)}" target="_blank" rel="noopener noreferrer">Open</a></td>
+                <td><a href="${row.bestbuy_sku ? bestBuySkuUrl(row.bestbuy_sku) : retailerSearchUrl("bestbuy", row.product_query)}" target="_blank" rel="noopener noreferrer">${row.bestbuy_sku ? `SKU ${escapeHtml(row.bestbuy_sku)}` : "Open"}</a></td>
+                <td><a href="${row.walmart_item ? walmartItemUrl(row.walmart_item) : retailerSearchUrl("walmart", row.product_query)}" target="_blank" rel="noopener noreferrer">${row.walmart_item ? `Item ${escapeHtml(row.walmart_item)}` : "Open"}</a></td>
+                <td><a href="${retailerSearchUrl("target", row.target_query || row.product_query)}" target="_blank" rel="noopener noreferrer">Open</a></td>
+              </tr>
+            `).join("")}
+          </tbody>
+        </table>
+      `).join("")}
+    </div>
+  `;
+  return res.send(renderPage("Catalog Matrix", body, user));
+});
+
+app.post("/collection/cards/upsert", requireAuth, (req, res) => {
+  const user = ownerOverride(getUserById(req.auth.sub));
+  const setName = String(req.body.set_name || "").trim();
+  const cardName = String(req.body.card_name || "").trim();
+  const cardNumber = String(req.body.card_number || "").trim() || null;
+  const rarity = String(req.body.rarity || "").trim() || null;
+  const quantity = Math.max(0, Number(req.body.quantity || 0) || 0);
+  const marketPrice = String(req.body.market_price || "").trim();
+  const averageCost = String(req.body.average_cost || "").trim();
+  const notes = String(req.body.notes || "").trim() || null;
+  if (!setName || !cardName) {
+    return res.redirect("/collection");
+  }
+  db.prepare(`
+    INSERT INTO collection_cards (user_id, set_name, card_name, card_number, rarity, quantity, market_price, average_cost, notes, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(user_id, set_name, card_name, card_number) DO UPDATE SET
+      rarity = excluded.rarity,
+      quantity = excluded.quantity,
+      market_price = excluded.market_price,
+      average_cost = excluded.average_cost,
+      notes = excluded.notes,
+      updated_at = excluded.updated_at
+  `).run(
+    user.id,
+    setName,
+    cardName,
+    cardNumber,
+    rarity,
+    quantity,
+    marketPrice ? Number(marketPrice) : null,
+    averageCost ? Number(averageCost) : null,
+    notes,
+    new Date().toISOString()
+  );
+  return res.redirect("/collection");
+});
+
+app.post("/collection/cards/:id/delete", requireAuth, (req, res) => {
+  const user = ownerOverride(getUserById(req.auth.sub));
+  db.prepare("DELETE FROM collection_cards WHERE id = ? AND user_id = ?").run(Number(req.params.id), user.id);
+  return res.redirect("/collection");
 });
 
 app.get("/pokemoncenter/feed", requireAuth, (_req, res) => {
@@ -3146,6 +3434,12 @@ function logStartupConfig() {
   } else {
     console.log("Source registry monitor disabled");
   }
+}
+
+try {
+  bootstrapCuratedOffers();
+} catch (err) {
+  console.error("Initial curated offer bootstrap failed:", err.message);
 }
 
 module.exports = {

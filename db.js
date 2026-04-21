@@ -135,6 +135,23 @@ function createDb(dbPath = "app.db") {
       FOREIGN KEY(created_by_user_id) REFERENCES users(id)
     );
 
+    CREATE TABLE IF NOT EXISTS collection_cards (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL,
+      set_name TEXT NOT NULL,
+      card_name TEXT NOT NULL,
+      card_number TEXT,
+      rarity TEXT,
+      quantity INTEGER NOT NULL DEFAULT 0,
+      market_price REAL,
+      average_cost REAL,
+      notes TEXT,
+      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(user_id, set_name, card_name, card_number),
+      FOREIGN KEY(user_id) REFERENCES users(id)
+    );
+
     CREATE TABLE IF NOT EXISTS user_alert_preferences (
       user_id INTEGER PRIMARY KEY,
       discord_enabled INTEGER NOT NULL DEFAULT 1,
@@ -304,6 +321,7 @@ function createDb(dbPath = "app.db") {
     CREATE INDEX IF NOT EXISTS idx_suppression_events_created_at ON suppression_events(created_at);
     CREATE INDEX IF NOT EXISTS idx_pipeline_traces_created_at ON pipeline_traces(created_at);
     CREATE INDEX IF NOT EXISTS idx_notification_logs_due ON notification_logs(status, next_attempt_at, created_at);
+    CREATE INDEX IF NOT EXISTS idx_collection_cards_user_set ON collection_cards(user_id, set_name);
   `);
 
   db.prepare(`

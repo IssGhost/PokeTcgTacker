@@ -40,6 +40,33 @@ const CURATED_RELEASE_MONITOR_PACK = [
   { set_name: 'Temporal Forces', release_date: '2024-03-22', pokemoncenter_etb_url: 'https://www.pokemoncenter.com/product/188-85717/pokemon-tcg-scarlet-and-violet-temporal-forces-pokemon-center-elite-trainer-box-walking-wake', bestbuy_sku: '6571900', walmart_item: null, target_query: 'temporal forces elite trainer box' }
 ];
 
+const CURATED_PRODUCT_TYPES = [
+  { key: 'etb', label: 'Elite Trainer Box', query: 'elite trainer box' },
+  { key: 'bundle', label: 'Booster Bundle', query: 'booster bundle' },
+  { key: 'box', label: 'Booster Box', query: 'booster box' },
+  { key: 'blister', label: 'Blister / Sleeved', query: 'sleeved booster blister' }
+];
+
+function buildCuratedRetailMatrix() {
+  const rows = [];
+  for (const set of CURATED_RELEASE_MONITOR_PACK) {
+    for (const type of CURATED_PRODUCT_TYPES) {
+      rows.push({
+        set_name: set.set_name,
+        release_date: set.release_date,
+        product_type_key: type.key,
+        product_type_label: type.label,
+        product_query: `${set.set_name} ${type.query}`,
+        target_query: `${set.target_query || set.set_name} ${type.query}`.trim(),
+        bestbuy_sku: type.key === 'etb' ? (set.bestbuy_sku || null) : null,
+        walmart_item: type.key === 'etb' ? (set.walmart_item || null) : null,
+        pokemoncenter_etb_url: type.key === 'etb' ? set.pokemoncenter_etb_url : null
+      });
+    }
+  }
+  return rows;
+}
+
 function buildCatalogQueries() {
   const out = [];
   for (const set of LAST_10_RELEASED_SETS) {
@@ -59,5 +86,7 @@ module.exports = {
   LAST_10_RELEASED_SETS,
   PRODUCT_TYPE_TERMS,
   CURATED_RELEASE_MONITOR_PACK,
+  CURATED_PRODUCT_TYPES,
+  buildCuratedRetailMatrix,
   buildCatalogQueries
 };
