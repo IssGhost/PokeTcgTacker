@@ -38,7 +38,7 @@ function createDb(dbPath = "app.db") {
       last_scan_at TEXT,
       last_alerted_at TEXT,
       created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      UNIQUE(user_id, set_name, card_name, card_number),
+      UNIQUE(user_id, product_url),
       FOREIGN KEY(user_id) REFERENCES users(id)
     );
 
