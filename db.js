@@ -5,6 +5,8 @@ function createDb(dbPath = "app.db") {
   db.pragma("journal_mode = WAL");
 
   function hasColumn(tableName, columnName) {
+    const table = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?").get(tableName);
+    if (!table) return false;
     const columns = db.prepare(`PRAGMA table_info(${tableName})`).all();
     return columns.some((column) => column.name === columnName);
   }
@@ -324,6 +326,24 @@ function createDb(dbPath = "app.db") {
   }
   if (!hasColumn("notification_logs", "next_attempt_at")) {
     db.exec("ALTER TABLE notification_logs ADD COLUMN next_attempt_at TEXT");
+  }
+  if (!hasColumn("products", "set_name")) {
+    db.exec("ALTER TABLE products ADD COLUMN set_name TEXT");
+  }
+  if (!hasColumn("products", "product_type")) {
+    db.exec("ALTER TABLE products ADD COLUMN product_type TEXT");
+  }
+  if (!hasColumn("products", "release_date")) {
+    db.exec("ALTER TABLE products ADD COLUMN release_date TEXT");
+  }
+  if (!hasColumn("collection_cards", "set_name")) {
+    db.exec("ALTER TABLE collection_cards ADD COLUMN set_name TEXT NOT NULL DEFAULT 'Unknown Set'");
+  }
+  if (!hasColumn("collection_cards", "card_name")) {
+    db.exec("ALTER TABLE collection_cards ADD COLUMN card_name TEXT NOT NULL DEFAULT 'Unknown Card'");
+  }
+  if (!hasColumn("collection_cards", "quantity")) {
+    db.exec("ALTER TABLE collection_cards ADD COLUMN quantity INTEGER NOT NULL DEFAULT 0");
   }
 
   db.exec(`

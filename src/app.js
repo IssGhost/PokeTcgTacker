@@ -665,7 +665,10 @@ function fetchText(url, redirectCount = 0) {
     const client = getRequestClient(url);
     const req = client.get(url, {
       headers: {
-        "User-Agent": "PokemonAlertsBot/1.0 (+https://railway.app)"
+        "User-Agent": "Mozilla/5.0 (compatible; PokemonAlertsBot/1.0; +https://railway.app)",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Cache-Control": "no-cache"
       }
     }, (res) => {
       if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location && redirectCount < 5) {
@@ -688,7 +691,7 @@ function fetchText(url, redirectCount = 0) {
     });
 
     req.on("error", reject);
-    req.setTimeout(10000, () => {
+    req.setTimeout(7000, () => {
       req.destroy(new Error("Product page fetch timed out"));
     });
   });
@@ -881,7 +884,32 @@ async function sendPokemonCenterDiscordEvent(userId, event) {
 }
 
 async function monitorPokemonCenterProduct(productUrl) {
-  const html = await fetchText(productUrl);
+  let html = "";
+  try {
+    html = await fetchText(productUrl);
+  } catch (err) {
+    if (String(err.message || "").includes("403")) {
+      recordSuppression(db, {
+        source_key: "pokemoncenter",
+        product_offer_id: null,
+        product_url: productUrl,
+        reason: "suppressed_by_403_block",
+        details: { error: err.message }
+      });
+      return {
+        product: { canonical_name: "Pokemon Center Product" },
+        offerId: null,
+        state: STATES.UNKNOWN,
+        oldState: STATES.UNKNOWN,
+        price: null,
+        oldPrice: null,
+        transitioned: false,
+        droppedPrice: false,
+        snapshotHash: null
+      };
+    }
+    throw err;
+  }
   const titleMatch = html.match(/<title>([^<]+)<\/title>/i);
   const title = titleMatch ? titleMatch[1].replace(/\s*\|\s*Pokémon Center\s*$/i, "").trim() : "Pokémon Center Product";
   const parsedSignal = parsePokemonCenterSignal({
@@ -1233,7 +1261,25 @@ async function monitorMajorRetailOffer(offerRow) {
     }
   }
 
-  html = await fetchText(offerRow.product_url);
+  try {
+    if (offerRow.adapter_key === "bestbuy" && apiProduct) {
+      html = "";
+    } else {
+      html = await fetchText(offerRow.product_url);
+    }
+  } catch (err) {
+    if (offerRow.adapter_key === "bestbuy" && String(offerRow.product_url || "").includes("searchpage.jsp")) {
+      recordSuppression(db, {
+        source_key: offerRow.adapter_key,
+        product_offer_id: offerRow.id,
+        product_url: offerRow.product_url,
+        reason: "suppressed_by_unreachable_search_page",
+        details: { error: err.message }
+      });
+      return { transitioned: false, droppedPrice: false, state: offerRow.current_state || STATES.UNKNOWN, title, price: offerRow.last_seen_price, oldState };
+    }
+    throw err;
+  }
   const fallbackPrice = parseFirstPrice(html);
   if (offerRow.adapter_key === "bestbuy") {
     signal = parseBestBuySignal({
@@ -1255,7 +1301,9 @@ async function monitorMajorRetailOffer(offerRow) {
   const confirmResult = await twoPassConfirm({
     initialSignal: signal,
     fetchSignalAgain: async () => {
-      const html2 = await fetchText(offerRow.product_url);
+      const html2 = (offerRow.adapter_key === "bestbuy" && apiProduct)
+        ? ""
+        : await fetchText(offerRow.product_url);
       if (offerRow.adapter_key === "bestbuy") {
         return parseBestBuySignal({
           apiProduct,
