@@ -38,6 +38,7 @@ function createDb(dbPath = "app.db") {
       last_scan_at TEXT,
       last_alerted_at TEXT,
       created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(user_id, set_name, card_name, card_number),
       FOREIGN KEY(user_id) REFERENCES users(id)
     );
 
@@ -186,7 +187,6 @@ function createDb(dbPath = "app.db") {
       message TEXT NOT NULL,
       status TEXT NOT NULL DEFAULT 'queued',
       created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      UNIQUE(user_id, set_name, card_name, card_number),
       FOREIGN KEY(user_id) REFERENCES users(id)
     );
 
@@ -346,7 +346,7 @@ function createDb(dbPath = "app.db") {
     db.exec("ALTER TABLE collection_cards ADD COLUMN quantity INTEGER NOT NULL DEFAULT 0");
   }
 
-  db.exec(`
+  const createIndexes = () => db.exec(`
     CREATE INDEX IF NOT EXISTS idx_monitor_snapshots_detected_at ON monitor_snapshots(detected_at);
     CREATE INDEX IF NOT EXISTS idx_raw_sightings_detected_at ON raw_sightings(detected_at);
     CREATE INDEX IF NOT EXISTS idx_raw_sightings_source_key ON raw_sightings(source_key);
@@ -358,6 +358,19 @@ function createDb(dbPath = "app.db") {
     CREATE INDEX IF NOT EXISTS idx_collection_cards_user_set ON collection_cards(user_id, set_name);
     CREATE INDEX IF NOT EXISTS idx_import_audit_logs_created_at ON import_audit_logs(created_at);
   `);
+  try {
+    createIndexes();
+  } catch (err) {
+    if (String(err.message || "").includes("set_name")) {
+      // Defensive fallback for legacy collection_cards schemas observed in production.
+      try { db.exec("ALTER TABLE collection_cards ADD COLUMN set_name TEXT NOT NULL DEFAULT 'Unknown Set'"); } catch {}
+      try { db.exec("ALTER TABLE collection_cards ADD COLUMN card_name TEXT NOT NULL DEFAULT 'Unknown Card'"); } catch {}
+      try { db.exec("ALTER TABLE collection_cards ADD COLUMN quantity INTEGER NOT NULL DEFAULT 0"); } catch {}
+      createIndexes();
+    } else {
+      throw err;
+    }
+  }
 
   db.prepare(`
     INSERT OR IGNORE INTO retailers (name, base_url, adapter_key, enabled)
